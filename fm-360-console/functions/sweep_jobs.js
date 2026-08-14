@@ -85,25 +85,7 @@ function hoursSince(iso) {
   return isNaN(ms) ? null : ms / 3600000;
 }
 
-/* Record deep link. The web app's only generic resolver route is
-   /:app/goto/summary/:moduleName/:id, and it matches moduleName EXACTLY against
-   the route table — the route registers `serviceRequest`, so the lowercase
-   `servicerequest` this used to emit resolved to pagenotfound. Modules with no
-   OVERVIEW route (e.g. `finding`) get "" so callers can omit the View button.
-   See feed.js for the full evidence note. */
-const LINKABLE_MODULES = {
-  servicerequest: "serviceRequest",
-  serviceRequest: "serviceRequest",
-  workorder: "workorder",
-  workpermit: "workpermit",
-  purchaseorder: "purchaseorder",
-  quote: "quote",
-};
-const recUrl = (mod, id) => {
-  const canonical = LINKABLE_MODULES[String(mod || "")];
-  if (!canonical || id == null || id === "" || String(id) === "0") return "";
-  return `https://app.facilio.com/maintenance/goto/summary/${canonical}/${id}`;
-};
+const recUrl = (mod, id) => `https://app.facilio.com/maintenance/goto/summary/${mod}/${id}`;
 const money = (n) => (n == null || isNaN(Number(n)) ? "" : Number(n).toLocaleString());
 
 /* --------------------------------------------------------- org constants */
@@ -720,187 +702,689 @@ async function askAgent(agentLink, title, message) {
   }
 }
 
-/* Assumed, not configured. This org has no populated responseDueDate, so there
-   is no contractual target to read — the number below is a stated assumption and
-   every row derived from it is written as data_confidence 'derived'. */
-const ASSUMED_RESPONSE_TARGET_H = 4;
+/* ------------------------------------------------- shared signal helpers */
 
-async function slaEvidence(d) {
-  const open = await listAll(
-    "list-service-requests",
-    { filters: `moduleState=${SR_SUBMITTED}`, expand: "client,siteId", sort_by: "sysCreatedTime", sort_order: "desc", page_size: 200 },
-    3
-  );
-  const groups = {};
-  for (const r of open) {
-    const h = hoursSince(r.sysCreatedTime);
-    if (h == null) continue;
-    const key = nameOf(r.client) || nameOf(r.siteId) || "Unattributed";
-    if (!groups[key]) groups[key] = { total: 0, over: 0, hours: [] };
-    groups[key].total++;
-    groups[key].hours.push(h);
-    if (h > ASSUMED_RESPONSE_TARGET_H) groups[key].over++;
+const idOf = (v) => {
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "object" && v.id != null) return Number(v.id);
+  const n = Number(v);
+  return isNaN(n) ? null : n;
+};
+
+const num = (v) => {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return isNaN(n) ? null : n;
+};
+
+const round2 = (n) => (n == null ? null : Number(Number(n).toFixed(2)));
+
+async function listCustom(module, input, maxPages) {
+  const pages = maxPages || 2;
+  const size = (input && input.page_size) || 200;
+  let out = [];
+  for (let page = 1; page <= pages; page++) {
+    const rows = rowsOf(await cmms("list-custom-module-records", { ...input, custom_module: module, page, page_size: size }));
+    out = out.concat(rows);
+    if (rows.length < size) break;
   }
-  const items = [];
-  for (const key of Object.keys(groups)) {
-    const g = groups[key];
-    if (!g.over) continue;
-    const avg = g.hours.reduce((a, b) => a + b, 0) / g.hours.length;
-    items.push({
-      external_id: `sla:acknowledgement:${key.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
-      bucket: "sla", source_module: "servicerequest",
-      ref: key, title: `${key} — ${g.over} of ${g.total} requests unacknowledged beyond target`,
-      meta: `Open service requests · average age ${avg.toFixed(1)} h · assumed ${ASSUMED_RESPONSE_TARGET_H} h response target`,
-      metric_name: "Requests unacknowledged beyond target",
-      metric_value: Number(avg.toFixed(2)), metric_unit: "hours",
-      baseline_value: ASSUMED_RESPONSE_TARGET_H,
-      variance_value: Number((avg - ASSUMED_RESPONSE_TARGET_H).toFixed(2)),
-      occurrence_count: g.over, sample_size: g.total,
-      period_label: "Currently open", client: key, tenant: key,
-      data_confidence: "derived",
-      dataConfidenceNote:
-        `Computed from real sysCreatedTime values, but the ${ASSUMED_RESPONSE_TARGET_H} h target is ASSUMED — this org has no populated responseDueDate or configured SLA. Vendor attribution is not possible because service requests carry no vendor.`,
-    });
-  }
-  return items;
+  return out;
 }
 
-/* quoting — quotes flagged ispricediffered_quote=true by workflow rule 3401207,
-   compared against the vendor's rate card (custom_ratecard).
-   The list-quotes action ignores its `filters` param entirely — verified live:
-   both `ispricediffered_quote=true` and a plain subject(contains) filter returned
-   every quote — so this pages the module and filters in code. The custom boolean
-   is only present in the payload when explicitly selected. */
-const RATECARD_RATE_FIELDS = [
-  ["Normal hours (Mon-Fri)", "normal_hours_monday___friday__per_hour__custom_ratecard"],
-  ["After hours", "after_hours__per_hour__custom_ratecard"],
-  ["Saturday", "saturday__per_hour__custom_ratecard"],
-  ["Sunday", "sunday__per_hour__custom_ratecard"],
-  ["Call-out fee", "call_out_fee_custom_ratecard"],
-];
+/* ============================== QUOTING ==============================
+   Quote line items compared against the vendor's contracted rate card.
+   The rate card is the custom module `custom_ratecard`, whose display name is
+   "Site Preferred Supplier Agreement". There is NO foreign key from a quote to
+   a rate card, so the join is composed on vendor + site. */
+
+const RATE_FIELDS = {
+  // Field names are exact; note the triple underscore between monday and friday.
+  normal_hours: "normal_hours_monday___friday__per_hour__custom_ratecard",
+  after_hours: "after_hours__per_hour__custom_ratecard",
+  saturday: "saturday__per_hour__custom_ratecard",
+  sunday: "sunday__per_hour__custom_ratecard",
+  call_out: "call_out_fee_custom_ratecard",
+};
+
+const BAND_LABEL = {
+  normal_hours: "Normal hours (Mon-Fri)", after_hours: "After hours",
+  saturday: "Saturday", sunday: "Sunday", call_out: "Call out fee",
+};
+
+// Fallback when the classifier agent is unavailable, so the detector still runs.
+function bandByKeyword(li) {
+  const t = ((li.description || "") + " " + (li.type || "")).toLowerCase();
+  if (/call\s*-?\s*out|callout|attendance fee|mobilis|truck fee|service call fee/.test(t)) return "call_out";
+  if (/sunday/.test(t)) return "sunday";
+  if (/saturday/.test(t)) return "saturday";
+  if (/after\s*hours|out of hours|overnight|night shift|public holiday/.test(t)) return "after_hours";
+  if (/\bpart|material|supply|filter|valve|cable|hire|disposal|freight|equipment|consumable/.test(t)) return "not_labour";
+  if (/labour|labor|technician|electrician|plumber|per hour|hourly|\bhrs?\b/.test(t)) return "normal_hours";
+  return "unknown";
+}
+
+async function loadRateCards() {
+  const select = ["id", "name", "moduleState", "siteId", "vendor_custom_ratecard", "contract_custom_ratecard"]
+    .concat(Object.keys(RATE_FIELDS).map((k) => RATE_FIELDS[k])).join(",");
+  const rows = await listCustom("custom_ratecard", { select, page_size: 200 }, 2);
+  const index = {};
+  let priced = 0, unpriced = 0;
+  for (const r of rows) {
+    const rates = {};
+    let has = false;
+    for (const band of Object.keys(RATE_FIELDS)) {
+      const v = num(r[RATE_FIELDS[band]]);
+      if (v != null) { rates[band] = v; has = true; }
+    }
+    // A rate card row with every rate null is not a zero-priced card — skip it.
+    if (!has) { unpriced++; continue; }
+    priced++;
+    const vId = idOf(r.vendor_custom_ratecard), sId = idOf(r.siteId);
+    if (vId == null || sId == null) continue;
+    index[vId + ":" + sId] = {
+      id: r.id, name: r.name, rates, contractId: idOf(r.contract_custom_ratecard),
+    };
+  }
+  return { index, priced, unpriced, scanned: rows.length };
+}
+
+// Contract validity gate. Dates are frequently unset in this org, so an absent
+// window is reported rather than treated as either valid or expired.
+async function contractStatus(contractId, cache) {
+  if (contractId == null) return { ok: false, note: "rate card has no linked contract" };
+  if (cache[contractId]) return cache[contractId];
+  let res;
+  try {
+    const r = await cmms("get-custom-module-record", { custom_module: "custom_contracts", id: contractId });
+    const c = (r && r.data) || {};
+    const state = typeof c.moduleState === "string" ? c.moduleState : nameOf(c.moduleState);
+    const from = c.contract_start_date_custom_contracts, to = c.contract_end_date_custom_contracts;
+    const active = /active|hold\s*over|roll(ed)?\s*over/i.test(String(state || ""));
+    let note = `contract ${c.name || contractId} state '${state || "unknown"}'`;
+    if (!from && !to) note += ", no start/end dates set";
+    res = { ok: active, state, from, to, name: c.name, note };
+  } catch (e) {
+    res = { ok: false, note: "contract lookup failed: " + String(e.message || e).slice(0, 80) };
+  }
+  cache[contractId] = res;
+  return res;
+}
 
 async function quotingEvidence(d) {
-  // The two pre-live seeded rows carried an ai_note claiming this org has no
-  // rate card source. custom_ratecard now exists, so that claim is false —
-  // retire them rather than keep showing fiction beside real signals.
-  const retired = d.query(
-    "update signal set status = 'retired', updated_at = $1 where bucket = 'quoting' and data_confidence = 'seeded' and status <> 'retired'",
-    [nowIso()]
-  );
+  const cards = await loadRateCards();
+  if (!cards.priced) {
+    return {
+      items: [],
+      note: `Scanned ${cards.scanned} rate cards; none carry any rate value, so no quote could be compared.`,
+    };
+  }
 
-  const quotes = await listAll(
-    "list-quotes",
-    {
-      select: "id,localId,subject,vendor,siteId,subTotal,totalCost,sysCreatedTime,ispricediffered_quote",
-      sort_by: "sysCreatedTime", sort_order: "desc", page_size: 100,
-    },
-    3
-  );
-  const flagged = quotes.filter((q) => q.ispricediffered_quote === true);
+  const quotes = await listAll("list-quotes", {
+    expand: "vendor,siteId", sort_by: "sysModifiedTime", sort_order: "desc", page_size: 200,
+  }, 2);
 
-  const cards = flagged.length
-    ? await listAll(
-        "list-custom-module-records",
-        {
-          custom_module: "custom_ratecard",
-          select: "id,name,vendor_custom_ratecard,siteId," + RATECARD_RATE_FIELDS.map((f) => f[1]).join(","),
-          page_size: 100,
-        },
-        3
-      )
-    : [];
-
-  const items = [];
-  for (const q of flagged) {
-    const resp = await cmms("get-quote", { id: q.id });
-    const full = resp && resp.data ? resp.data : resp;
-    const lines = Array.isArray(full.lineItems) ? full.lineItems : [];
-    let maxLine = null;
-    for (const li of lines) {
-      if (li.unitPrice != null && (maxLine == null || Number(li.unitPrice) > Number(maxLine.unitPrice))) maxLine = li;
+  // Pull line items (list-quotes does not return them) and keep only quotes that
+  // have a rate card for their vendor+site.
+  const candidates = [];
+  let noCard = 0;
+  for (const q of quotes) {
+    const vId = idOf(q.vendor), sId = idOf(q.siteId);
+    const card = (vId != null && sId != null) ? cards.index[vId + ":" + sId] : null;
+    if (!card) { noCard++; continue; }
+    let lines = [];
+    try {
+      const full = await cmms("get-quote", { id: q.id });
+      lines = ((full && full.data && full.data.lineItems) || []);
+    } catch (e) {
+      continue;
     }
-    const quoted = maxLine != null ? Number(maxLine.unitPrice) : null;
+    if (!lines.length) continue;
+    candidates.push({ quote: q, card, lines, vendorId: vId, siteId: sId });
+  }
+  if (!candidates.length) {
+    return { items: [], note: `${quotes.length} quotes read; ${noCard} had no rate card for their vendor+site combination.` };
+  }
 
-    const vendorId = full.vendor && full.vendor.id != null ? Number(full.vendor.id) : null;
-    const vendorName = nameOf(full.vendor);
-    const siteIdNum = full.siteId && full.siteId.id != null ? Number(full.siteId.id) : null;
-    const siteName = nameOf(full.siteId);
+  // Classify each line's rate band. This is the one genuinely ambiguous step —
+  // the band is only inferable from the line's own text.
+  const allLines = [];
+  for (const c of candidates) {
+    for (const li of c.lines) {
+      allLines.push({ lineId: String(li.id), type: li.type || "", description: li.description || "", quantity: li.quantity, unitPrice: li.unitPrice });
+    }
+  }
+  const bands = {};
+  let classifier = "keyword-fallback";
+  const CHUNK = 4;
+  let okChunks = 0, failChunks = 0;
+  for (let i = 0; i < allLines.length; i += CHUNK) {
+    const chunk = allLines.slice(i, i + CHUNK);
+    try {
+      const out = await askAgentRetry(
+        "fm360-ratecard-classifier",
+        `FM360 ratecard #${Math.floor(i / CHUNK) + 1}`,
+        "Classify each of these quote line items into a rate card band.\n\n" + JSON.stringify(chunk)
+      );
+      for (const it of (out && out.items) || []) {
+        if (it.lineId) bands[String(it.lineId)] = { band: it.band, reasoning: it.reasoning, confidence: it.confidence, by: "agent" };
+      }
+      okChunks++;
+    } catch (e) {
+      failChunks++;
+    }
+  }
+  if (okChunks && !failChunks) classifier = "agent";
+  else if (okChunks) classifier = "agent-partial";
+  for (const l of allLines) {
+    if (!bands[l.lineId]) bands[l.lineId] = { band: bandByKeyword(l), reasoning: "keyword fallback", confidence: 0.4, by: "keyword" };
+  }
 
-    // Prefer a card for this vendor at this site; fall back to any card for the
-    // vendor. Baseline is the HIGHEST rate on the card — conservative: a quote
-    // above it exceeds every rate the vendor ever agreed to.
-    const vendorCards = cards.filter((c) => c.vendor_custom_ratecard && Number(c.vendor_custom_ratecard.id) === vendorId);
-    const siteCards = vendorCards.filter((c) => c.siteId && Number(c.siteId.id) === siteIdNum);
-    const pool = siteCards.length ? siteCards : vendorCards;
-    let card = null, baseline = null, baselineLabel = "";
-    for (const c of pool) {
-      for (const [label, f] of RATECARD_RATE_FIELDS) {
-        const v = c[f];
-        if (v != null && !isNaN(Number(v)) && (baseline == null || Number(v) > baseline)) {
-          baseline = Number(v);
-          baselineLabel = label;
-          card = c;
+  const contractCache = {};
+  const items = [];
+  let quotesChecked = 0, linesChecked = 0;
+  for (const c of candidates) {
+    const contract = await contractStatus(c.card.contractId, contractCache);
+    quotesChecked++;
+    const over = [];
+    let checked = 0, quotedTotal = 0, expectedTotal = 0;
+    const skipped = [];
+    for (const li of c.lines) {
+      const b = bands[String(li.id)] || {};
+      const rate = b.band && c.card.rates[b.band] != null ? c.card.rates[b.band] : null;
+      if (rate == null) { skipped.push({ id: li.id, band: b.band || "unknown", why: b.band === "not_labour" ? "not priced by the rate card" : "no rate for band" }); continue; }
+      checked++;
+      const unit = num(li.unitPrice), qty = num(li.quantity) || 1;
+      if (unit == null) continue;
+      quotedTotal += unit * qty;
+      expectedTotal += rate * qty;
+      if (unit > rate) {
+        over.push({ id: li.id, description: li.description, band: b.band, bandLabel: BAND_LABEL[b.band] || b.band,
+          unitPrice: unit, rate, quantity: qty, lineVariance: round2((unit - rate) * qty),
+          pct: round2(((unit - rate) / rate) * 100), by: b.by, confidence: b.confidence });
+      }
+    }
+    linesChecked += checked;
+    if (!over.length) continue;
+
+    const variance = round2(quotedTotal - expectedTotal);
+    const pct = expectedTotal > 0 ? round2((variance / expectedTotal) * 100) : null;
+    const worst = over.slice().sort((a, b2) => (b2.pct || 0) - (a.pct || 0))[0];
+    const inferred = over.filter((o) => o.by === "agent").length;
+
+    items.push({
+      external_id: `quoting:quote:${c.quote.id}`,
+      bucket: "quoting", source_module: "quote", source_record_id: c.quote.id,
+      ref: "QT-" + (c.quote.localId || c.quote.id),
+      title: `${nameOf(c.quote.vendor) || "Vendor"} quoted ${pct != null ? pct + "% " : ""}above the contracted rate card`,
+      meta: [c.quote.subject, nameOf(c.quote.siteId), `Quoted ${money(quotedTotal)} vs rate card ${money(expectedTotal)}`,
+        `Rate card ${c.card.name}`].filter(Boolean).join(" · "),
+      signal_type: "abnormal_quote",
+      vendor: nameOf(c.quote.vendor), vendor_id: c.vendorId, site: nameOf(c.quote.siteId),
+      metric_name: "Quoted vs contracted rate", metric_unit: "currency",
+      metric_value: round2(quotedTotal), baseline_value: round2(expectedTotal),
+      variance_value: variance, variance_pct: pct,
+      occurrence_count: over.length, sample_size: checked,
+      period_label: "Current quote", record_url: recUrl("quote", c.quote.id),
+      data_confidence: "native",
+      dataConfidenceNote:
+        `Both sides are read from real records: quote line unitPrice and rate card ${c.card.name} (id ${c.card.id}). ` +
+        `Worst line: ${worst.bandLabel} quoted ${worst.unitPrice} against a contracted ${worst.rate}. ` +
+        `The rate BAND for each line was inferred from the line's own text (${inferred} of ${over.length} by the classifier agent), ` +
+        `because line items carry no structured day/rate discriminator. ` +
+        `Quote-to-rate-card join is composed on vendor + site; there is no foreign key. ${contract.note}.` +
+        (contract.ok ? "" : " CONTRACT IS NOT ACTIVE — treat the benchmark as indicative only.") +
+        (skipped.length ? ` ${skipped.length} line(s) not comparable.` : ""),
+      overLines: over,
+    });
+  }
+  return {
+    items,
+    note: `${quotes.length} quotes, ${quotesChecked} with a rate card, ${linesChecked} lines compared, ${items.length} over rate. ` +
+      `Rate cards: ${cards.priced} priced of ${cards.scanned} scanned (${cards.unpriced} have no rates). Band classifier: ${classifier}.`,
+  };
+}
+
+/* ============================== INVOICING ==============================
+   Two detectors. (a) invoice vs purchase order, deterministic, real data today.
+   (b) field service report vs invoice, agent-read, dormant until an FSR file
+   is uploaded to custom_polineinvoices. */
+
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// No Buffer or atob in this sandbox, so base64 is decoded by hand.
+function b64ToBytes(s) {
+  const clean = String(s || "").replace(/[^A-Za-z0-9+/]/g, "");
+  const out = [];
+  for (let i = 0; i < clean.length; i += 4) {
+    const c0 = B64_ALPHABET.indexOf(clean.charAt(i)), c1 = B64_ALPHABET.indexOf(clean.charAt(i + 1));
+    const h2 = clean.charAt(i + 2), h3 = clean.charAt(i + 3);
+    const c2 = h2 ? B64_ALPHABET.indexOf(h2) : 0, c3 = h3 ? B64_ALPHABET.indexOf(h3) : 0;
+    if (c0 < 0 || c1 < 0) break;
+    const n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+    out.push((n >> 16) & 255);
+    if (h2) out.push((n >> 8) & 255);
+    if (h3) out.push(n & 255);
+  }
+  return new Uint8Array(out);
+}
+
+function bytesToText(bytes) {
+  try { return new TextDecoder("utf-8").decode(bytes); } catch (e) { return ""; }
+}
+
+/* Reads an FSR file field and returns plain text.
+   Two verified traps handled here:
+   - download-a-file-field returns HTTP 400/404 INSIDE ok:true, base64-encoded
+     with content_type application/json, so a failure looks like a success.
+   - is_not_empty silently no-ops on FILE fields, so emptiness is discovered by
+     probing the download rather than by filtering. */
+async function readFileFieldText(moduleName, recordId, fieldName) {
+  let res;
+  try {
+    res = await cmms("download-a-file-field", { module_name: moduleName, record_id: recordId, field_name: fieldName });
+  } catch (e) {
+    return { ok: false, reason: "download failed: " + String(e.message || e).slice(0, 120) };
+  }
+  const ct = String((res && res.content_type) || "").toLowerCase();
+  const b64 = res && res.file_base64;
+  if (!b64) return { ok: false, reason: "no file content returned" };
+
+  if (ct.indexOf("application/json") >= 0) {
+    // Error envelope masquerading as a file.
+    const txt = bytesToText(b64ToBytes(b64)).slice(0, 300);
+    return { ok: false, reason: "no file set on the field (" + txt + ")" };
+  }
+  if (ct.indexOf("text/") >= 0 || ct.indexOf("json") >= 0 || ct.indexOf("csv") >= 0 || ct.indexOf("xml") >= 0) {
+    const txt = bytesToText(b64ToBytes(b64));
+    if (!txt.trim()) return { ok: false, reason: "file decoded to empty text" };
+    return { ok: true, text: txt, via: "text", contentType: ct };
+  }
+  // Binary — PDF or image. Needs OCR, which is a separate connection.
+  const isPdf = ct.indexOf("pdf") >= 0;
+  const fileType = isPdf ? "PDF" : ct.indexOf("png") >= 0 ? "PNG" : ct.indexOf("tif") >= 0 ? "TIF" : ct.indexOf("bmp") >= 0 ? "BMP" : ct.indexOf("gif") >= 0 ? "GIF" : "JPG";
+  try {
+    const ocr = await callAction("ocr-space", "extract-text-from-image-or-pdf", {
+      base64_image: "data:" + ct + ";base64," + b64,
+      file_type: fileType,
+      table_mode: true,
+      detect_orientation: true,
+      upscale_low_quality: true,
+    });
+    const text = (ocr && (ocr.text || ocr.ParsedText || ocr.parsed_text)) ||
+      (ocr && ocr.pages && ocr.pages.map ? ocr.pages.map((p) => p.text || p.ParsedText || "").join("\n") : "");
+    if (!text || !String(text).trim()) return { ok: false, reason: "OCR returned no text from the " + fileType };
+    return { ok: true, text: String(text), via: "ocr", contentType: ct };
+  } catch (e) {
+    return { ok: false, reason: `FSR is a ${fileType} and OCR is unavailable (${String(e.message || e).slice(0, 90)})`, binary: true, contentType: ct };
+  }
+}
+
+// FSR records for a purchase order. Empty in this org today.
+async function fsrForPo(poId) {
+  try {
+    const rows = await listCustom("custom_polineinvoices", {
+      filters: `purchase_order_custom_polineinvoices=${poId}`,
+      select: "id,name,moduleState,lineid,po_line_number_custom_polineinvoices,purchase_order_custom_polineinvoices,service_report_custom_polineinvoices",
+      page_size: 50,
+    }, 1);
+    return rows;
+  } catch (e) {
+    return [];
+  }
+}
+
+async function invoicingEvidence(d, opts) {
+  const cap = (opts && opts.cap) || 25;
+  const invoices = await listAll("list-invoices", {
+    expand: "purchaseOrder,vendor", sort_by: "sysModifiedTime", sort_order: "desc", page_size: 200,
+  }, 1);
+
+  const linked = [], unlinked = [];
+  for (const inv of invoices) {
+    (idOf(inv.purchaseOrder) != null ? linked : unlinked).push(inv);
+  }
+
+  // Header totals arrive on the list response, so the first pass costs nothing.
+  // A matching total does NOT mean the lines agree — quantity and unit price can
+  // offset each other — so lines are checked too, header mismatches first.
+  const headerMismatch = [], headerMatch = [];
+  for (const inv of linked) {
+    const po = inv.purchaseOrder || {};
+    const iTot = num(inv.totalCost), pTot = num(po.totalCost);
+    if (iTot == null || pTot == null) continue;
+    (Math.abs(iTot - pTot) > 0.01 ? headerMismatch : headerMatch).push({ inv, po, iTot, pTot });
+  }
+
+  const ordered = headerMismatch.concat(headerMatch);
+  const truncated = ordered.length > cap;
+  const work = ordered.slice(0, cap);
+  const items = [];
+  let fsrSeen = 0;
+
+  for (const m of work) {
+    const poId = idOf(m.po);
+    let invLines = [], poLines = [];
+    try {
+      const full = await cmms("get-invoice", { id: m.inv.id });
+      invLines = (full && full.data && full.data.lineItems) || [];
+    } catch (e) {}
+    let poReadError = null;
+    try {
+      const poFull = await callAction("cbre-clone", "get-purchase-order", { po_id: poId });
+      // Shape is { code, data: { purchaseorder: { lineItems: [...] } } } — the
+      // purchaseorder level is easy to miss, and missing it silently yields zero
+      // lines, which previously looked like a discrepancy on every invoice.
+      const pd = (poFull && poFull.data) || poFull || {};
+      const poObj = pd.purchaseorder || pd.purchaseOrder || pd;
+      poLines = (poObj && poObj.lineItems) || [];
+    } catch (e) {
+      poReadError = String(e.message || e).slice(0, 100);
+    }
+
+    // Invoice lines name their PO line id in the description, e.g.
+    // "... | PO Line 1 (PO line item id 82623)".
+    const poById = {};
+    for (const pl of poLines) poById[String(pl.id)] = pl;
+    const lineFindings = [];
+    // Not being able to read the order's lines is a gap in evidence, NOT a
+    // discrepancy. Treating it as one produced a false positive on every invoice.
+    const linesComparable = poLines.length > 0;
+    for (let i = 0; linesComparable && i < invLines.length; i++) {
+      const il = invLines[i];
+      const m2 = /PO line item id\s*(\d+)/i.exec(String(il.description || ""));
+      const pl = (m2 && poById[m2[1]]) || poLines[i] || null;
+      if (!pl) { lineFindings.push({ invoiceLine: il.id, issue: "invoice has more lines than the order", invoiceCost: num(il.cost) }); continue; }
+      const dq = (num(il.quantity) || 0) - (num(pl.quantity) || 0);
+      const du = (num(il.unitPrice) || 0) - (num(pl.unitPrice) || 0);
+      const dc = (num(il.cost) || 0) - (num(pl.cost) || 0);
+      if (Math.abs(dq) > 0.001 || Math.abs(du) > 0.01 || Math.abs(dc) > 0.01) {
+        lineFindings.push({
+          invoiceLine: il.id, poLine: pl.id, description: il.description,
+          invoiceQty: num(il.quantity), poQty: num(pl.quantity),
+          invoiceUnitPrice: num(il.unitPrice), poUnitPrice: num(pl.unitPrice),
+          invoiceCost: num(il.cost), poCost: num(pl.cost),
+          qtyDelta: round2(dq), unitPriceDelta: round2(du), costDelta: round2(dc),
+        });
+      }
+    }
+
+    // FSR path. Nothing exists in this org yet, so this normally adds nothing.
+    let fsr = null;
+    const fsrRows = await fsrForPo(poId);
+    fsrSeen += fsrRows.length;
+    if (fsrRows.length) {
+      for (const fr of fsrRows) {
+        const got = await readFileFieldText("custom_polineinvoices", fr.id, "service_report_custom_polineinvoices");
+        if (!got.ok) { fsr = { present: true, readable: false, reason: got.reason, recordId: fr.id }; continue; }
+        try {
+          const audit = await askAgentRetry(
+            "fm360-fsr-auditor",
+            "FM360 FSR " + m.inv.id,
+            "Compare this field service report against the invoice line items.\n\nFSR TEXT:\n" + String(got.text).slice(0, 6000) +
+            "\n\nINVOICE LINE ITEMS:\n" + JSON.stringify(invLines.map((l) => ({ id: l.id, type: l.type, description: l.description, quantity: l.quantity, unitPrice: l.unitPrice, cost: l.cost })))
+          );
+          fsr = { present: true, readable: !!(audit && audit.readable), via: got.via, recordId: fr.id, audit };
+          break;
+        } catch (e) {
+          fsr = { present: true, readable: false, reason: "auditor agent failed: " + String(e.message || e).slice(0, 90), recordId: fr.id };
         }
       }
     }
 
-    const variance = quoted != null && baseline != null ? Number((quoted - baseline).toFixed(2)) : null;
-    const variancePct = variance != null && baseline ? Number(((variance / baseline) * 100).toFixed(2)) : null;
+    const variance = round2(m.iTot - m.pTot);
+    const pct = m.pTot > 0 ? round2((variance / m.pTot) * 100) : null;
+    const dirWord = variance > 0 ? "above" : "below";
+    const hasHeaderVariance = Math.abs(m.iTot - m.pTot) > 0.01;
+    const fsrFindings = (fsr && fsr.audit && fsr.audit.discrepancies) || [];
 
-    const cardRates = {};
-    if (card) for (const [label, f] of RATECARD_RATE_FIELDS) { if (card[f] != null) cardRates[label] = Number(card[f]); }
+    // Nothing disagreed — an invoice that matches its order is not a signal.
+    if (!hasHeaderVariance && !lineFindings.length && !fsrFindings.length) continue;
+
+    const headline = hasHeaderVariance
+      ? `${nameOf(m.inv.vendor) || "Vendor"} invoiced ${money(Math.abs(variance))} ${dirWord} the order value`
+      : fsrFindings.length
+        ? `${nameOf(m.inv.vendor) || "Vendor"} invoice disagrees with the field service report on ${fsrFindings.length} point(s)`
+        : `${nameOf(m.inv.vendor) || "Vendor"} invoice matches the order total but ${lineFindings.length} line(s) differ`;
+
+    const fsrNote = !fsrRows.length
+      ? "No field service report is attached to this order, so hours and parts could not be verified against a report."
+      : fsr && fsr.readable
+        ? `Field service report read via ${fsr.via}; ${((fsr.audit && fsr.audit.discrepancies) || []).length} discrepancy(ies) found.`
+        : `A field service report is attached but could not be read: ${(fsr && fsr.reason) || "unknown reason"}.`;
 
     items.push({
-      external_id: `quoting:quote:${q.id}`,
-      bucket: "quoting", source_module: "quote", source_record_id: q.id,
-      ref: "Q-" + (q.localId || q.id),
-      title: card
-        ? `${vendorName || "Vendor"} quoted above their rate card`
-        : `${vendorName || "Vendor"} quote flagged as price-differed (no rate card found)`,
-      meta: [
-        full.subject || "(no subject)",
-        siteName,
-        quoted != null ? `Quoted ${money(quoted)}/unit` + (maxLine && maxLine.description ? ` (${maxLine.description})` : "") : "",
-        baseline != null ? `Rate card max ${money(baseline)} (${baselineLabel})` : "No rate card for this vendor",
-      ].filter(Boolean).join(" · "),
-      vendor: vendorName, vendor_id: vendorId, site: siteName,
-      metric_name: "max_quoted_rate",
-      metric_value: quoted, metric_unit: "per hour",
-      baseline_value: baseline,
-      variance_value: variance,
-      variance_pct: variancePct,
-      period_label: "Current open quotes",
-      data_confidence: "native",
-      dataConfidenceNote: card
-        ? `Flagged natively by workflow rule (ispricediffered_quote=true) at quote creation. Baseline read from rate card '${card.name}' (#${card.id}); ${baseline != null ? `highest agreed rate is ${baseline} (${baselineLabel})` : "no rates set"}. Quoted line prices are real; which rate class applies to each line is inferred from the line description, not a structured field.`
-        : "Flagged natively by workflow rule (ispricediffered_quote=true) at quote creation, but no custom_ratecard row matches this vendor, so no baseline or variance could be computed.",
-      record_url: recUrl("quote", q.id),
-      raw: {
-        quoteId: q.id, subject: full.subject, subTotal: full.subTotal, totalCost: full.totalCost,
-        lineItems: lines.map((li) => ({ description: li.description, quantity: li.quantity, unitPrice: li.unitPrice, cost: li.cost })),
-        ratecard: card ? { id: card.id, name: card.name, rates: cardRates } : null,
-      },
+      external_id: `invoicing:invoice:${m.inv.id}`,
+      bucket: "invoicing", source_module: "invoice", source_record_id: m.inv.id,
+      ref: m.inv.invoiceNumber || ("INV-" + (m.inv.localId || m.inv.id)),
+      title: headline,
+      meta: [m.inv.subject, `Invoice ${money(m.iTot)} vs order ${money(m.pTot)}`,
+        `PO ${m.po.name || poId}`, `${lineFindings.length} line difference(s)`,
+        fsrFindings.length ? `${fsrFindings.length} report discrepancy(ies)` : ""].filter(Boolean).join(" · "),
+      signal_type: "invoice_variance",
+      vendor: nameOf(m.inv.vendor), vendor_id: idOf(m.inv.vendor),
+      metric_name: "Invoiced vs ordered", metric_unit: "currency",
+      metric_value: round2(m.iTot), baseline_value: round2(m.pTot),
+      variance_value: variance, variance_pct: pct,
+      occurrence_count: lineFindings.length, sample_size: invLines.length,
+      period_label: m.inv.billDate || "Current invoice",
+      record_url: recUrl("invoice", m.inv.id),
+      data_confidence: fsr && fsr.readable && fsr.via === "ocr" ? "derived" : "native",
+      dataConfidenceNote:
+        `Invoice total ${m.iTot} against purchase order total ${m.pTot}, both read directly from their records. ` +
+        (!linesComparable
+          ? `The order's line items could not be read${poReadError ? " (" + poReadError + ")" : ""}, so only the header totals were compared — no line-level check was possible. `
+          : lineFindings.length
+            ? `${lineFindings.length} line-level difference(s) identified across ${invLines.length} invoice line(s) and ${poLines.length} order line(s). `
+            : `All ${invLines.length} invoice line(s) reconcile to the order lines; the variance is at header level only. `) +
+        fsrNote,
+      lineFindings, fsr,
     });
   }
 
   return {
     items,
-    retiredSeeds: retired.rowCount || 0,
-    note:
-      `${flagged.length} of ${quotes.length} quotes carry ispricediffered_quote=true` +
-      (flagged.length ? "." : "; no abnormal-quoting signals this run.") +
-      (retired.rowCount ? ` Retired ${retired.rowCount} seeded placeholder row(s).` : "") +
-      " list-quotes ignores its filters param (verified), so quotes were paged and filtered in code.",
+    note: `${invoices.length} invoices read, ${linked.length} linked to a purchase order, ${unlinked.length} skipped as unlinked ` +
+      `(their description records no matching PO/SO/UO in this org). ${headerMismatch.length} had a header variance; ` +
+      `${work.length} compared line by line` +
+      (truncated ? `, capped at ${cap} this run — ${ordered.length - cap} linked invoices not examined.` : ".") +
+      ` ${items.length} signal(s) raised.` +
+      (fsrSeen ? "" : " No field service report records exist in this org yet, so the FSR audit path found nothing to read."),
   };
 }
 
-function seedSignalEvidence(d, bucket, unavailable) {
-  return seedRows(d, bucket, 10).map((s) => ({
-    external_id: `${bucket}:seed:${s.external_id || s.ref}`,
-    bucket, source_module: "console_seed", ref: s.ref, title: s.title, meta: s.meta,
-    vendor: s.vendor || "", data_confidence: "seeded",
-    dataConfidenceNote: unavailable,
-  }));
+/* ================================= SLA =================================
+   Targets come from the org's real SLA policy, not a hardcoded number.
+   Breaches are grouped per vendor and a repeat-history flag is computed. */
+
+async function loadSlaConfig() {
+  const pols = await callAction("facilio-process-automation", "list-sla-policies", { moduleName: "workorder" });
+  const active = ((pols && pols.items) || []).filter((p) => p.active !== false && p.status !== false);
+  if (!active.length) return null;
+
+  const policyId = active[0].id;
+  const detail = await callAction("facilio-process-automation", "get-sla-policy", { moduleName: "workorder", policyId });
+  const ents = await callAction("facilio-process-automation", "list-sla-entities", { moduleName: "workorder" });
+
+  const entities = {};
+  for (const e of (ents && ents.items) || []) {
+    entities[String(e.id)] = { name: e.name, toStateId: e.toStateId, breachType: e.breachType };
+  }
+  // commitments carry their priority in a criteria string, e.g. "( priority = 2732 )"
+  const byPriority = {};
+  for (const c of (detail && detail.commitments) || []) {
+    const m = /priority\s*=\s*(\d+)/.exec(String(c.criteria || ""));
+    if (!m) continue;
+    const durations = {};
+    for (const se of c.slaEntities || []) {
+      const secs = num(se.durationPlaceHolder);
+      if (secs != null) durations[String(se.slaEntityId)] = secs;
+    }
+    byPriority[m[1]] = { name: c.name, durations };
+  }
+
+  // States that pause the SLA clock. This is why no due date is ever written in
+  // this org: every work order sits in a paused state.
+  // Work orders report moduleState as a STRING ("Submitted"), not an object with
+  // an id, so states must be resolvable by name as well as by id.
+  const paused = {}, stateName = {}, idByName = {};
+  try {
+    const st = await callAction("facilio-process-automation", "list-states", { moduleName: "workorder" });
+    for (const s of (st && st.items) || []) {
+      const label = s.displayName || s.status || String(s.id);
+      stateName[String(s.id)] = label;
+      if (s.status) idByName[String(s.status).toLowerCase()] = s.id;
+      if (s.displayName) idByName[String(s.displayName).toLowerCase()] = s.id;
+      if (s.pauseSLA === true) paused[String(s.id)] = true;
+    }
+  } catch (e) {}
+
+  return { policyId, policyName: detail && detail.name, criteria: detail && detail.criteria, entities, byPriority, paused, stateName, idByName };
+}
+
+async function slaEvidence(d) {
+  const cfg = await loadSlaConfig();
+  if (!cfg) {
+    return { items: [], note: "No active SLA policy is configured for work orders, so no breach could be evaluated." };
+  }
+
+  const wos = await listAll("list-work-orders", {
+    expand: "vendor,priority,moduleState", sort_by: "createdTime", sort_order: "desc", page_size: 200,
+  }, 2);
+
+  const nowMs = Date.now();
+  const breaches = [];
+  const totalByVendor = {};
+  let noVendorBreaches = 0, pausedBreaches = 0, noPolicyMatch = 0;
+
+  for (const w of wos) {
+    const vId = idOf(w.vendor);
+    if (vId != null) totalByVendor[vId] = (totalByVendor[vId] || 0) + 1;
+
+    // moduleState comes back as a string on work orders, so resolve by name first
+    // and fall back to an id if a future response nests the object.
+    const stateStr = stateOf(w);
+    const stateId = (stateStr && cfg.idByName[String(stateStr).toLowerCase()]) != null
+      ? cfg.idByName[String(stateStr).toLowerCase()]
+      : idOf(w.moduleState);
+    const isPaused = stateId != null && cfg.paused[String(stateId)] === true;
+    const created = w.createdTime || w.sysCreatedTime;
+    const pId = idOf(w.priority);
+    const commitment = pId != null ? cfg.byPriority[String(pId)] : null;
+
+    let kind = null, entityName = null, targetIso = null, overdueH = null;
+
+    // Explicit: a due date the record itself carries, already in the past.
+    if (w.dueDate) {
+      const t = new Date(w.dueDate).getTime();
+      if (!isNaN(t) && t < nowMs) {
+        kind = "explicit"; entityName = "Due date"; targetIso = w.dueDate; overdueH = (nowMs - t) / 3600000;
+      }
+    }
+    // Computed: createdTime + the policy duration for this priority, where the
+    // record has not reached the entity's target state.
+    if (!kind && commitment && created) {
+      for (const eid of Object.keys(commitment.durations)) {
+        const ent = cfg.entities[eid] || {};
+        const reached = ent.toStateId != null && stateId === ent.toStateId;
+        const target = new Date(created).getTime() + commitment.durations[eid] * 1000;
+        if (!reached && !isNaN(target) && target < nowMs) {
+          kind = "computed"; entityName = ent.name || ("entity " + eid);
+          targetIso = new Date(target).toISOString(); overdueH = (nowMs - target) / 3600000;
+          break;
+        }
+      }
+    }
+    if (!kind && !commitment) noPolicyMatch++;
+    if (!kind) continue;
+    if (isPaused) pausedBreaches++;
+    if (vId == null) { noVendorBreaches++; continue; }
+
+    breaches.push({
+      woId: w.id, ref: "WO-" + (w.localId || w.id), subject: w.subject || "",
+      vendorId: vId, vendorName: nameOf(w.vendor) || ("Vendor " + vId),
+      kind, entityName, targetIso, overdueH: round2(overdueH),
+      paused: isPaused, created, priorityName: commitment ? commitment.name : "",
+      stateName: cfg.stateName[String(stateId)] || "",
+    });
+  }
+
+  const byVendor = {};
+  for (const b of breaches) {
+    if (!byVendor[b.vendorId]) byVendor[b.vendorId] = { name: b.vendorName, list: [] };
+    byVendor[b.vendorId].list.push(b);
+  }
+
+  const items = [];
+  for (const vId of Object.keys(byVendor)) {
+    const g = byVendor[vId];
+    const list = g.list;
+    const days = {};
+    for (const b of list) days[String(b.created || "").slice(0, 10)] = true;
+    const distinctDays = Object.keys(days).filter(Boolean).length;
+    const sample = totalByVendor[vId] || list.length;
+    const avgOver = list.reduce((a, b) => a + (b.overdueH || 0), 0) / list.length;
+    const worst = list.slice().sort((a, b) => (b.overdueH || 0) - (a.overdueH || 0))[0];
+    const allPaused = list.every((b) => b.paused);
+    const explicit = list.filter((b) => b.kind === "explicit").length;
+    const sorted = list.map((b) => String(b.created || "")).filter(Boolean).sort();
+    const insufficient = sample < 5 || distinctDays < 2;
+    const repeat = distinctDays >= 2;
+    const breachPct = sample > 0 ? round2((list.length / sample) * 100) : null;
+
+    items.push({
+      external_id: `sla:vendor:${vId}`,
+      bucket: "sla", source_module: "workorder", source_record_id: worst ? worst.woId : null,
+      ref: g.name,
+      title: `${g.name} breached ${entityLabel(list)} on ${list.length} of ${sample} work order${sample === 1 ? "" : "s"}`,
+      meta: [`${list.length} of ${sample} work orders breached (${breachPct}%)`,
+        `across ${distinctDays} day(s)`,
+        `average overrun ${round2(avgOver)} h`,
+        repeat ? "repeat offender" : "single-day occurrence",
+        allPaused ? "SLA clock paused on every record" : ""].filter(Boolean).join(" · "),
+      signal_type: "sla_breach",
+      vendor: g.name, vendor_id: Number(vId),
+      metric_name: "Average hours past SLA target", metric_unit: "hours",
+      metric_value: round2(avgOver), baseline_value: 0,
+      variance_value: round2(avgOver),
+      // Deliberately null. In the quoting signal variance_pct means "how far above
+      // the benchmark price"; a percentage against a zero-hour target is
+      // meaningless, and putting the breach RATE here would make the same column
+      // mean two different things. The rate lives in occurrence_count/sample_size.
+      variance_pct: null,
+      occurrence_count: list.length, sample_size: sample,
+      period_label: sorted.length ? `${sorted[0].slice(0, 10)} to ${sorted[sorted.length - 1].slice(0, 10)} (${distinctDays} day(s))` : "Current",
+      period_start: sorted.length ? sorted[0] : "", period_end: sorted.length ? sorted[sorted.length - 1] : "",
+      record_url: worst ? recUrl("workorder", worst.woId) : "",
+      data_confidence: "derived",
+      dataConfidenceNote:
+        `Targets read from SLA policy "${cfg.policyName}" (id ${cfg.policyId}) — ${explicit} of ${list.length} breach(es) came from a due date on the record, the rest were computed as createdTime plus the policy duration for the record's priority. ` +
+        (allPaused
+          ? `ADVISORY ONLY: every breaching record sits in a state that PAUSES the SLA clock (${worst ? worst.stateName : "paused state"}), which is why no due date was ever written by the platform. These are not asserted contractual breaches. `
+          : "") +
+        (insufficient
+          ? `INSUFFICIENT HISTORY: ${list.length} breach(es) over a sample of ${sample} across ${distinctDays} day(s). A breach rate over time cannot be established from this — do not read it as a trend. `
+          : `${list.length} breaches across ${distinctDays} distinct days indicates a repeat pattern. `) +
+        `Vendor attribution is via workorder.vendor; service requests carry no vendor field and have no SLA policy, so they are excluded.`,
+      insufficient_history: insufficient,
+      repeat_offender: repeat,
+      breaches: list.slice(0, 10),
+    });
+  }
+
+  return {
+    items,
+    note: `Policy "${cfg.policyName}" (${cfg.policyId}). ${wos.length} work orders scanned, ${breaches.length} breaching with a vendor, ` +
+      `${noVendorBreaches} breaching without a vendor (excluded), ${pausedBreaches} on a paused SLA clock, ` +
+      `${noPolicyMatch} with no priority commitment in the policy. ${items.length} vendor signal(s).`,
+  };
+}
+
+function entityLabel(list) {
+  const names = {};
+  for (const b of list) if (b.entityName) names[b.entityName] = true;
+  const k = Object.keys(names);
+  return k.length === 1 ? k[0].replace(/ Due Date$/i, "").toLowerCase() + " SLA" : "SLA";
 }
 
 async function doSignals(args) {
@@ -908,27 +1392,69 @@ async function doSignals(args) {
     const now = nowIso();
     const flowRunId = (args && args.flow_run_id) || "sweep-" + now.replace(/[-:.TZ]/g, "").slice(0, 14);
 
+    // Each detector reads real records and computes its own comparison. There is
+    // no seed fallback here: a detector that finds nothing writes nothing and
+    // says so, rather than padding the tab with demo rows.
+    const want = args && args.buckets
+      ? String(args.buckets).split(",").map((s) => s.trim()).filter(Boolean)
+      : ["quoting", "invoicing", "sla"];
+
+    const DETECTORS = {
+      quoting: () => quotingEvidence(d),
+      invoicing: () => invoicingEvidence(d, { cap: Number(args && args.invoice_cap) || 25 }),
+      sla: () => slaEvidence(d),
+    };
+
     let evidence = [];
     const notes = {};
-    try {
-      const sla = await slaEvidence(d);
-      evidence = evidence.concat(sla);
-      notes.sla = `${sla.length} tenant/site groups over the assumed ${ASSUMED_RESPONSE_TARGET_H}h target.`;
-    } catch (e) {
-      notes.sla = "ERROR: " + String(e.message || e).slice(0, 160);
+    for (const bucket of want) {
+      const run = DETECTORS[bucket];
+      if (!run) { notes[bucket] = "unknown signal bucket"; continue; }
+      const startedAt = nowIso();
+      d.query(
+        "insert into flow_run (flow_run_id, bucket, agent_name, status, records_read, records_written, error, started_at, finished_at) values ($1,$2,'sweep_signals','running',0,0,'',$3,'')",
+        [flowRunId, bucket, startedAt]
+      );
+      try {
+        const res = await run();
+        evidence = evidence.concat(res.items || []);
+        notes[bucket] = res.note || "";
+        d.query(
+          "update flow_run set status='ok', records_read=$3, records_written=$4, error=$5, finished_at=$6 where flow_run_id=$1 and bucket=$2",
+          [flowRunId, bucket, (res.items || []).length, (res.items || []).length, res.note || "", nowIso()]
+        );
+      } catch (e) {
+        const msg = String(e && e.message ? e.message : e).slice(0, 300);
+        notes[bucket] = "ERROR: " + msg;
+        d.query(
+          "update flow_run set status='error', error=$3, finished_at=$4 where flow_run_id=$1 and bucket=$2",
+          [flowRunId, bucket, msg, nowIso()]
+        );
+      }
     }
-    try {
-      const q = await quotingEvidence(d);
-      evidence = evidence.concat(q.items);
-      notes.quoting = q.note;
-    } catch (e) {
-      notes.quoting = "ERROR: " + String(e.message || e).slice(0, 160);
-    }
-    const invoicing = seedSignalEvidence(d, "invoicing", "This org has no invoice module and no field service report source, so the comparison cannot be made.");
-    evidence = evidence.concat(invoicing);
-    notes.invoicing = `${invoicing.length} seeded rows (no invoice source exists).`;
 
-    if (!evidence.length) return { ok: true, flowRunId, written: 0, notes, message: "No signal evidence to write." };
+    // Retiring must also happen when nothing qualified — that is exactly the case
+    // where yesterday's signals have been resolved and must leave the tab.
+    const retireStale = () => {
+      let n = 0;
+      for (const bucket of want) {
+        if (notes[bucket] && String(notes[bucket]).indexOf("ERROR") === 0) continue; // a failed detector must not retire anything
+        const r = d.query(
+          "update signal set status='resolved', updated_at=$3 where bucket=$1 and status='open' and (flow_run_id is null or flow_run_id <> $2)",
+          [bucket, flowRunId, now]
+        );
+        n += r.rowCount || 0;
+      }
+      return n;
+    };
+
+    if (!evidence.length) {
+      return {
+        ok: true, flowRunId, evidence: 0, inserted: 0, updated: 0,
+        retired: retireStale(), notes,
+        message: "No signal qualified; nothing written.",
+      };
+    }
 
     let judged = {};
     let agentStatus = "skipped";
@@ -979,22 +1505,66 @@ async function doSignals(args) {
           { label: "Snapshot for QBR", kind: "primary", act: "open" },
           { label: "View Detail", kind: "ghost", act: "open" },
         ],
-        raw: e.raw || {},
+        // Keep the working: the offending lines, the SLA breaches or the FSR audit
+        // are what make a signal auditable rather than a bare number.
+        raw: {
+          overLines: e.overLines, lineFindings: e.lineFindings, fsr: e.fsr,
+          breaches: e.breaches, insufficient_history: e.insufficient_history,
+          repeat_offender: e.repeat_offender,
+        },
       };
       upsertSignal(d, row, now, flowRunId) === "inserted" ? inserted++ : updated++;
     }
-    return { ok: true, flowRunId, evidence: evidence.length, inserted, updated, agentStatus, notes };
+
+    // Retire signals this run no longer detects. Without this a resolved issue
+    // stays on the tab forever, because a detector can only ever add rows.
+    const retired = retireStale();
+
+    return { ok: true, flowRunId, evidence: evidence.length, inserted, updated, retired, agentStatus, notes };
 }
 
 server.addHandler({
   name: "signals",
   description:
-    "Compute evidence for the three signal tabs, have the no-tool signal analyst interpret it, and upsert the result into the signal module.",
+    "Detect all three signal types from real records — quote vs rate card, invoice vs purchase order (and FSR when present), and SLA breaches per vendor — then have the signal analyst interpret them.",
   parameters: {
     flow_run_id: { description: "Optional id stamped on every row written", type: "string" },
-    skip_agent: { description: "Set 'true' to write the computed evidence without the agent pass", type: "string" },
+    buckets: { description: "Comma-separated subset of quoting,invoicing,sla; omit for all three", type: "string" },
+    invoice_cap: { description: "Max invoices to examine in detail per run (default 25)", type: "number" },
+    skip_agent: { description: "Set 'true' to write the computed evidence without the interpretation pass", type: "string" },
   },
   execute: async (args) => doSignals(args || {}),
+});
+
+server.addHandler({
+  name: "quoting_signal",
+  description: "Detect quote line items priced above the vendor's contracted rate card.",
+  parameters: {
+    flow_run_id: { description: "Optional flow run id", type: "string" },
+    skip_agent: { description: "Set 'true' to skip the interpretation pass", type: "string" },
+  },
+  execute: async (args) => doSignals({ ...(args || {}), buckets: "quoting" }),
+});
+
+server.addHandler({
+  name: "invoicing_signal",
+  description: "Detect invoices that differ from their purchase order, and audit any attached field service report against the invoice.",
+  parameters: {
+    flow_run_id: { description: "Optional flow run id", type: "string" },
+    invoice_cap: { description: "Max invoices to examine in detail (default 25)", type: "number" },
+    skip_agent: { description: "Set 'true' to skip the interpretation pass", type: "string" },
+  },
+  execute: async (args) => doSignals({ ...(args || {}), buckets: "invoicing" }),
+});
+
+server.addHandler({
+  name: "sla_signal",
+  description: "Detect SLA breaches against the org's real SLA policy and aggregate them per vendor with a repeat-offender history.",
+  parameters: {
+    flow_run_id: { description: "Optional flow run id", type: "string" },
+    skip_agent: { description: "Set 'true' to skip the interpretation pass", type: "string" },
+  },
+  execute: async (args) => doSignals({ ...(args || {}), buckets: "sla" }),
 });
 
 /* ---------------------------------------------------------- prioritize */
@@ -1094,6 +1664,7 @@ server.addHandler({
   parameters: {
     window_hours: { description: "Look-back window in hours (default 24)", type: "number" },
     rank_limit: { description: "How many jobs the prioritizer re-ranks (default 25)", type: "number" },
+    invoice_cap: { description: "How many invoices to compare line by line (default 10 here, to keep the whole run inside the job timeout)", type: "number" },
   },
   execute: async (args) => {
     const now = nowIso();
@@ -1107,7 +1678,9 @@ server.addHandler({
       out.sweep = { ok: false, error: String(e.message || e).slice(0, 250) };
     }
     try {
-      out.signals = await doSignals({ flow_run_id: flowRunId });
+      // Invoicing is the slowest detector (two extra reads per invoice), so the
+      // daily run caps it lower than a manual run to stay inside the job timeout.
+      out.signals = await doSignals({ flow_run_id: flowRunId, invoice_cap: Number(args && args.invoice_cap) || 10 });
     } catch (e) {
       out.signals = { ok: false, error: String(e.message || e).slice(0, 250) };
     }
