@@ -1,0 +1,7 @@
+{
+  "name": "FM Copilot",
+  "app": "fm-copilot-teamv",
+  "build": {
+    "publish": "dist"
+  }
+}

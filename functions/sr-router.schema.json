@@ -1,0 +1,30 @@
+{
+  "title": "SrRouterDecision",
+  "type": "object",
+  "properties": {
+    "studioAgent": {
+      "type": "string",
+      "enum": ["acknowledge_service_request", "create_work_order"],
+      "description": "Which Facilio Studio agent should handle this request."
+    },
+    "message": {
+      "type": "string",
+      "description": "The message to send to that Studio agent, restating the user's intent with the concrete values it needs."
+    },
+    "srId": {
+      "type": "number",
+      "description": "The service request record id this concerns."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One sentence on why this Studio agent was chosen."
+    },
+    "missingInfo": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Values the Studio agent will need that the user has not supplied yet. Empty when nothing is missing."
+    }
+  },
+  "required": ["studioAgent", "message", "srId", "rationale", "missingInfo"],
+  "additionalProperties": false
+}
