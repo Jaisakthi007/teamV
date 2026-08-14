@@ -100,7 +100,13 @@ const BUCKETS = {
         created_time: r.sysCreatedTime || "",
         record_url: "https://app.facilio.com/maintenance/tenantservices/servicerequest/all/" + id + "/overview?tabName=properties",
         system_modified_time: r.sysModifiedTime || "",
-        actions: [{ label: "Acknowledge", kind: "primary", act: "action" }, { label: "View", kind: "ghost", act: "open" }],
+        // Acknowledge hands the record to the Service Request Operations team in
+        // the console's agent panel, which performs the acknowledge and stays open
+        // for the follow-on steps (work order, procurement, RFQ).
+        actions: [
+          { label: "Acknowledge", kind: "primary", act: "agent", prompt: "Acknowledge this tenant service request." },
+          { label: "View", kind: "ghost", act: "open" },
+        ],
       };
     },
   },
@@ -125,11 +131,13 @@ const BUCKETS = {
       const qp = r.tenant_quote_path_serviceRequest || "";
       const meta = [location || null, tenant ? "Tenant: " + tenant : null, qp ? "Quote path: " + qp : null].filter(Boolean).join(" · ");
 
-      // Buttons depend on the tenant quote path
+      // Buttons depend on the tenant quote path. Create Work Order hands the record
+      // to the Service Request Operations team in the agent panel (intent-based
+      // opening), which raises the WO and stays open for procurement + RFQ.
+      const woAction = { label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order", prompt: "Raise the work order for this request." };
       const actions = [];
-      if (qp === "Procure Vendor Quotes") actions.push({ label: "Create Work Order", kind: "primary", act: "action" });
-      else if (qp === "Provide In-House CBRE Quote") actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
-      else actions.push({ label: "Create Work Order", kind: "primary", act: "action" });
+      if (qp === "Provide In-House CBRE Quote") actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
+      else actions.push(woAction);
       actions.push({ label: "View", kind: "ghost", act: "open" });
 
       return {

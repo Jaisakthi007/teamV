@@ -4,6 +4,10 @@ import { createVibe } from "@facilio/vibe-sdk";
 const vibe = createVibe();
 const PAGE_SIZE = 10;
 const POLL_MS = 30000; // smart-poll cadence for live counts
+const AGENT_TOPIC = "srops";       // where agent_bridge publishes each turn's result
+const AGENT_TIMEOUT_MS = 660000;   // just past the run's 600s ceiling; a killed run never publishes
+const newRunId = () =>
+  (globalThis.crypto?.randomUUID?.() ?? "run-" + Math.random().toString(36).slice(2) + Date.now().toString(36));
 const BUILD = "v11 · tenant quote dialog";
 
 const C = {
@@ -39,11 +43,13 @@ export default function App() {
   const [quote, setQuote] = useState(null);
   const [quoteAmount, setQuoteAmount] = useState("");
   const [quoteBusy, setQuoteBusy] = useState(false);
+  const [agent, setAgent] = useState(null); // { job, threadId, turns[], busy }
   const [toast, setToast] = useState(null);
   const [lastTick, setLastTick] = useState(null);
   const [live, setLive] = useState(true);
   const stateRef = useRef({ bucket: null, page: 1, counts: [] });
   stateRef.current = { bucket, page, counts };
+  const agentTimer = useRef(null);
 
   const actor = user?.user?.name || user?.user?.email || "";
 
@@ -85,6 +91,27 @@ export default function App() {
     return () => { clearInterval(timer); document.removeEventListener("visibilitychange", onVis); };
   }, [authed]);
 
+  // One subscription for the whole console. Every tab hears every agent run, so
+  // each keeps only the run it started; the functional update also dodges the
+  // stale-closure problem a long-lived callback would otherwise have.
+  useEffect(() => {
+    if (!authed) return;
+    const sub = vibe.subscribe(AGENT_TOPIC, (evt) => {
+      const p = (evt && evt.payload) || {};
+      if (!p.runId) return;
+      setAgent((a) => {
+        if (!a || a.runId !== p.runId) return a;
+        clearTimeout(agentTimer.current);
+        const turn = p.ok
+          ? { role: "agent", text: p.reply || "(no reply)" }
+          : { role: "error", text: p.error || "The team could not complete that." };
+        return { ...a, busy: false, runId: null, threadId: a.threadId || p.threadId || null, turns: [...a.turns, turn] };
+      });
+      if (p.ok) refreshCounts();
+    });
+    return () => sub.unsubscribe();
+  }, [authed]); // eslint-disable-line
+
   async function refreshCounts() {
     try {
       const r = await vibe.executeFunction("feed", "counts", {});
@@ -114,6 +141,10 @@ export default function App() {
   async function takeAction(job, action) {
     if (action.act === "open") { if (job.record_url) window.open(job.record_url, "_blank", "noopener"); return; }
     if (action.act === "quote") { setQuote({ job }); setQuoteAmount(""); return; }
+    // Acknowledging a TSR is a conversation with the Service Request Operations
+    // team, not a one-shot write: the team performs the acknowledge and stays open
+    // for the follow-on steps (work order, procurement, RFQ).
+    if (action.act === "agent") { openAgent(job, action); return; }
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     // optimistic: remove the card and drop the badge now
@@ -131,6 +162,68 @@ export default function App() {
       }
     } catch (e) { flash("Action failed: " + (e?.message || e)); await loadPage(bucket, page); }
     finally { setActingId(null); }
+  }
+
+  /**
+   * Start one agent turn.
+   *
+   * The team delegates across four member agents, which routinely outlasts a
+   * synchronous call — so the run is fired with executeFunctionAsync and its reply
+   * comes back over the 'srops' topic, matched on the runId minted here.
+   */
+  async function runAgentTurn({ handler, args, job, prompt }) {
+    const runId = newRunId();
+    setAgent((a) => {
+      const base = a || { job, threadId: null, turns: [] };
+      return { ...base, job: job || base.job, busy: true, runId, turns: [...base.turns, { role: "fm", text: prompt }] };
+    });
+
+    // A run killed from outside (timeout ceiling, deploy mid-run) can never publish,
+    // so the panel needs its own deadline or it waits for ever.
+    clearTimeout(agentTimer.current);
+    agentTimer.current = setTimeout(() => {
+      setAgent((a) => (a && a.runId === runId
+        ? { ...a, busy: false, runId: null, turns: [...a.turns, { role: "error", text: "The team is taking longer than expected. It may still be working — reopen this request in a moment to see where it got to." }] }
+        : a));
+    }, AGENT_TIMEOUT_MS);
+
+    try {
+      await vibe.executeFunctionAsync("agent_bridge", handler, { ...args, run_id: runId }, { timeoutSeconds: 600 });
+    } catch (e) {
+      clearTimeout(agentTimer.current);
+      setAgent((a) => (a && a.runId === runId
+        ? { ...a, busy: false, runId: null, turns: [...a.turns, { role: "error", text: String(e?.message || e) }] }
+        : a));
+    }
+  }
+
+  function openAgent(job, action) {
+    // The bubble shows the FM's intent; the message itself is omitted so the
+    // bridge's intent-based opening applies — it instructs the team to present
+    // the action's details and wait for the FM's confirmation before writing.
+    const opening = action.prompt || "Acknowledge this tenant service request.";
+    setAgent({ job, threadId: null, turns: [], busy: false, runId: null });
+    runAgentTurn({ handler: "start_async", args: { external_id: job.external_id, actor, intent: action.intent }, job, prompt: opening });
+  }
+
+  function sendAgent(text) {
+    const msg = String(text || "").trim();
+    if (!msg || !agent || agent.busy) return;
+    // Before the first reply lands there is no thread yet, so this prompt opens one.
+    const srId = Number(String(agent.job.external_id || "").split(":").pop()) || undefined;
+    const [handler, args] = agent.threadId
+      ? ["send_async", { thread_id: agent.threadId, message: msg, sr_id: srId }]
+      : ["start_async", { external_id: agent.job.external_id, message: msg, actor }];
+    runAgentTurn({ handler, args, job: agent.job, prompt: msg });
+  }
+
+  // The team writes to the record, so re-read the feed on close: an acknowledged
+  // TSR leaves moduleState=Open and drops off this bucket on its own.
+  async function closeAgent() {
+    clearTimeout(agentTimer.current);
+    setAgent(null);
+    await refreshCounts();
+    if (bucket) await loadPage(bucket, page);
   }
 
   async function submitQuote() {
@@ -270,9 +363,127 @@ export default function App() {
         </div>
       )}
 
+      {agent && <AgentPanel agent={agent} onSend={sendAgent} onClose={closeAgent} />}
+
       {toast && <div style={{ position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", background: C.ink, color: "#fff", padding: "11px 18px", borderRadius: 10, fontSize: 13.5, boxShadow: "0 6px 24px rgba(0,0,0,.22)", zIndex: 50 }}>{toast}</div>}
     </div>
   );
+}
+
+/**
+ * The Service Request Operations team, docked on the right of the record it is
+ * working on. The team acknowledges, then stays open for the follow-on steps —
+ * raise the work order, start procurement, put it out to quote.
+ */
+function AgentPanel({ agent, onSend, onClose }) {
+  const [draft, setDraft] = useState("");
+  const [rtState, setRtState] = useState(vibe.realtimeState);
+  const scroller = useRef(null);
+  const { job, turns, busy, threadId } = agent;
+
+  // Replies arrive over the socket, so its health is worth showing while waiting.
+  useEffect(() => vibe.onRealtimeState?.(setRtState), []);
+
+  useEffect(() => {
+    const el = scroller.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [turns, busy]);
+
+  function submit() {
+    const t = draft.trim();
+    if (!t || busy) return;
+    setDraft("");
+    onSend(t);
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 70, display: "flex", justifyContent: "flex-end" }}>
+      <div onClick={onClose} style={{ position: "absolute", inset: 0, background: "rgba(20,32,52,.35)" }} />
+      <aside style={{
+        position: "relative", width: 460, maxWidth: "94vw", background: C.card, height: "100%",
+        borderLeft: `1px solid ${C.border}`, boxShadow: "-8px 0 40px rgba(16,42,80,.16)",
+        display: "flex", flexDirection: "column",
+      }}>
+        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+              <span style={{ width: 8, height: 8, borderRadius: 8, background: C.purple, flex: "none" }} />
+              <strong style={{ fontSize: 14.5 }}>Service Request Operations</strong>
+            </div>
+            <div style={{ fontSize: 12.5, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {job.ref} · {job.title}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ ...btn(false), padding: "4px 10px", fontSize: 16, lineHeight: 1.1 }}>×</button>
+        </div>
+
+        <div ref={scroller} style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+          {turns.map((t, i) => <Turn key={i} turn={t} />)}
+          {busy && (
+            <div style={{ alignSelf: "flex-start", background: C.purpleSoft, border: "1px solid #E4DBFF", color: C.purple, borderRadius: 12, padding: "9px 13px", fontSize: 13 }}>
+              Working…
+            </div>
+          )}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 16px" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+            <textarea
+              rows={2} value={draft} disabled={busy}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }}
+              placeholder={busy ? "Waiting for the team…" : "Ask the team to do something — raise the work order, start procurement…"}
+              style={{
+                flex: 1, resize: "none", padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit",
+                border: `1px solid ${C.border}`, borderRadius: 9, outline: "none", background: busy ? C.bg : C.card, color: C.ink,
+              }}
+            />
+            <button onClick={submit} disabled={busy || !draft.trim()} style={{ ...btn(true), padding: "9px 16px", opacity: busy || !draft.trim() ? 0.5 : 1 }}>Send</button>
+          </div>
+          <div style={{ fontSize: 11.5, color: C.muted, marginTop: 7 }}>
+            Enter to send · Shift+Enter for a new line{threadId ? ` · thread ${threadId}` : ""}
+            {rtState && rtState !== "open" ? ` · reconnecting…` : ""}
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function Turn({ turn }) {
+  if (turn.role === "fm") {
+    return (
+      <div style={{ alignSelf: "flex-end", maxWidth: "85%", background: C.blue, color: "#fff", borderRadius: "12px 12px 3px 12px", padding: "9px 13px", fontSize: 13.5, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+        {turn.text}
+      </div>
+    );
+  }
+  if (turn.role === "error") {
+    return (
+      <div style={{ alignSelf: "flex-start", maxWidth: "92%", background: C.redSoft, color: "#8E1313", border: "1px solid #F3C9C9", borderRadius: 12, padding: "9px 13px", fontSize: 13, lineHeight: 1.5 }}>
+        {turn.text}
+      </div>
+    );
+  }
+  return (
+    <div style={{ alignSelf: "flex-start", maxWidth: "92%", background: C.bg, border: `1px solid ${C.border}`, borderRadius: "12px 12px 12px 3px", padding: "10px 13px", fontSize: 13.5, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+      {renderMd(turn.text)}
+    </div>
+  );
+}
+
+/** The agents answer in light markdown; bold and bullets are all that shows up. */
+function renderMd(text) {
+  return String(text || "").split("\n").map((line, i) => {
+    const bullet = /^\s*[-*•]\s+/.test(line);
+    const body = bullet ? line.replace(/^\s*[-*•]\s+/, "") : line;
+    const parts = body.split(/\*\*(.+?)\*\*/g).map((p, j) => (j % 2 ? <strong key={j}>{p}</strong> : p));
+    return (
+      <div key={i} style={bullet ? { paddingLeft: 14, textIndent: -9 } : undefined}>
+        {bullet ? "• " : null}{parts}
+      </div>
+    );
+  });
 }
 
 function Card({ r, acting, onAction }) {

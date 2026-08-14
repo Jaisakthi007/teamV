@@ -747,6 +747,135 @@ async function slaEvidence(d) {
   return items;
 }
 
+/* quoting — quotes flagged ispricediffered_quote=true by workflow rule 3401207,
+   compared against the vendor's rate card (custom_ratecard).
+   The list-quotes action ignores its `filters` param entirely — verified live:
+   both `ispricediffered_quote=true` and a plain subject(contains) filter returned
+   every quote — so this pages the module and filters in code. The custom boolean
+   is only present in the payload when explicitly selected. */
+const RATECARD_RATE_FIELDS = [
+  ["Normal hours (Mon-Fri)", "normal_hours_monday___friday__per_hour__custom_ratecard"],
+  ["After hours", "after_hours__per_hour__custom_ratecard"],
+  ["Saturday", "saturday__per_hour__custom_ratecard"],
+  ["Sunday", "sunday__per_hour__custom_ratecard"],
+  ["Call-out fee", "call_out_fee_custom_ratecard"],
+];
+
+async function quotingEvidence(d) {
+  // The two pre-live seeded rows carried an ai_note claiming this org has no
+  // rate card source. custom_ratecard now exists, so that claim is false —
+  // retire them rather than keep showing fiction beside real signals.
+  const retired = d.query(
+    "update signal set status = 'retired', updated_at = $1 where bucket = 'quoting' and data_confidence = 'seeded' and status <> 'retired'",
+    [nowIso()]
+  );
+
+  const quotes = await listAll(
+    "list-quotes",
+    {
+      select: "id,localId,subject,vendor,siteId,subTotal,totalCost,sysCreatedTime,ispricediffered_quote",
+      sort_by: "sysCreatedTime", sort_order: "desc", page_size: 100,
+    },
+    3
+  );
+  const flagged = quotes.filter((q) => q.ispricediffered_quote === true);
+
+  const cards = flagged.length
+    ? await listAll(
+        "list-custom-module-records",
+        {
+          custom_module: "custom_ratecard",
+          select: "id,name,vendor_custom_ratecard,siteId," + RATECARD_RATE_FIELDS.map((f) => f[1]).join(","),
+          page_size: 100,
+        },
+        3
+      )
+    : [];
+
+  const items = [];
+  for (const q of flagged) {
+    const resp = await cmms("get-quote", { id: q.id });
+    const full = resp && resp.data ? resp.data : resp;
+    const lines = Array.isArray(full.lineItems) ? full.lineItems : [];
+    let maxLine = null;
+    for (const li of lines) {
+      if (li.unitPrice != null && (maxLine == null || Number(li.unitPrice) > Number(maxLine.unitPrice))) maxLine = li;
+    }
+    const quoted = maxLine != null ? Number(maxLine.unitPrice) : null;
+
+    const vendorId = full.vendor && full.vendor.id != null ? Number(full.vendor.id) : null;
+    const vendorName = nameOf(full.vendor);
+    const siteIdNum = full.siteId && full.siteId.id != null ? Number(full.siteId.id) : null;
+    const siteName = nameOf(full.siteId);
+
+    // Prefer a card for this vendor at this site; fall back to any card for the
+    // vendor. Baseline is the HIGHEST rate on the card — conservative: a quote
+    // above it exceeds every rate the vendor ever agreed to.
+    const vendorCards = cards.filter((c) => c.vendor_custom_ratecard && Number(c.vendor_custom_ratecard.id) === vendorId);
+    const siteCards = vendorCards.filter((c) => c.siteId && Number(c.siteId.id) === siteIdNum);
+    const pool = siteCards.length ? siteCards : vendorCards;
+    let card = null, baseline = null, baselineLabel = "";
+    for (const c of pool) {
+      for (const [label, f] of RATECARD_RATE_FIELDS) {
+        const v = c[f];
+        if (v != null && !isNaN(Number(v)) && (baseline == null || Number(v) > baseline)) {
+          baseline = Number(v);
+          baselineLabel = label;
+          card = c;
+        }
+      }
+    }
+
+    const variance = quoted != null && baseline != null ? Number((quoted - baseline).toFixed(2)) : null;
+    const variancePct = variance != null && baseline ? Number(((variance / baseline) * 100).toFixed(2)) : null;
+
+    const cardRates = {};
+    if (card) for (const [label, f] of RATECARD_RATE_FIELDS) { if (card[f] != null) cardRates[label] = Number(card[f]); }
+
+    items.push({
+      external_id: `quoting:quote:${q.id}`,
+      bucket: "quoting", source_module: "quote", source_record_id: q.id,
+      ref: "Q-" + (q.localId || q.id),
+      title: card
+        ? `${vendorName || "Vendor"} quoted above their rate card`
+        : `${vendorName || "Vendor"} quote flagged as price-differed (no rate card found)`,
+      meta: [
+        full.subject || "(no subject)",
+        siteName,
+        quoted != null ? `Quoted ${money(quoted)}/unit` + (maxLine && maxLine.description ? ` (${maxLine.description})` : "") : "",
+        baseline != null ? `Rate card max ${money(baseline)} (${baselineLabel})` : "No rate card for this vendor",
+      ].filter(Boolean).join(" · "),
+      vendor: vendorName, vendor_id: vendorId, site: siteName,
+      metric_name: "max_quoted_rate",
+      metric_value: quoted, metric_unit: "per hour",
+      baseline_value: baseline,
+      variance_value: variance,
+      variance_pct: variancePct,
+      period_label: "Current open quotes",
+      data_confidence: "native",
+      dataConfidenceNote: card
+        ? `Flagged natively by workflow rule (ispricediffered_quote=true) at quote creation. Baseline read from rate card '${card.name}' (#${card.id}); ${baseline != null ? `highest agreed rate is ${baseline} (${baselineLabel})` : "no rates set"}. Quoted line prices are real; which rate class applies to each line is inferred from the line description, not a structured field.`
+        : "Flagged natively by workflow rule (ispricediffered_quote=true) at quote creation, but no custom_ratecard row matches this vendor, so no baseline or variance could be computed.",
+      record_url: recUrl("quote", q.id),
+      raw: {
+        quoteId: q.id, subject: full.subject, subTotal: full.subTotal, totalCost: full.totalCost,
+        lineItems: lines.map((li) => ({ description: li.description, quantity: li.quantity, unitPrice: li.unitPrice, cost: li.cost })),
+        ratecard: card ? { id: card.id, name: card.name, rates: cardRates } : null,
+      },
+    });
+  }
+
+  return {
+    items,
+    retiredSeeds: retired.rowCount || 0,
+    note:
+      `${flagged.length} of ${quotes.length} quotes carry ispricediffered_quote=true` +
+      (flagged.length ? "." : "; no abnormal-quoting signals this run.") +
+      (retired.rowCount ? ` Retired ${retired.rowCount} seeded placeholder row(s).` : "") +
+      " list-quotes ignores its filters param (verified), so quotes were paged and filtered in code.",
+  };
+}
+
 function seedSignalEvidence(d, bucket, unavailable) {
   return seedRows(d, bucket, 10).map((s) => ({
     external_id: `${bucket}:seed:${s.external_id || s.ref}`,
@@ -770,10 +899,15 @@ async function doSignals(args) {
     } catch (e) {
       notes.sla = "ERROR: " + String(e.message || e).slice(0, 160);
     }
-    const quoting = seedSignalEvidence(d, "quoting", "This org has no rate card, contract or price list source, so a quote cannot be compared against a benchmark.");
+    try {
+      const q = await quotingEvidence(d);
+      evidence = evidence.concat(q.items);
+      notes.quoting = q.note;
+    } catch (e) {
+      notes.quoting = "ERROR: " + String(e.message || e).slice(0, 160);
+    }
     const invoicing = seedSignalEvidence(d, "invoicing", "This org has no invoice module and no field service report source, so the comparison cannot be made.");
-    evidence = evidence.concat(quoting, invoicing);
-    notes.quoting = `${quoting.length} seeded rows (no live quotes exist).`;
+    evidence = evidence.concat(invoicing);
     notes.invoicing = `${invoicing.length} seeded rows (no invoice source exists).`;
 
     if (!evidence.length) return { ok: true, flowRunId, written: 0, notes, message: "No signal evidence to write." };
@@ -827,7 +961,7 @@ async function doSignals(args) {
           { label: "Snapshot for QBR", kind: "primary", act: "open" },
           { label: "View Detail", kind: "ghost", act: "open" },
         ],
-        raw: {},
+        raw: e.raw || {},
       };
       upsertSignal(d, row, now, flowRunId) === "inserted" ? inserted++ : updated++;
     }
