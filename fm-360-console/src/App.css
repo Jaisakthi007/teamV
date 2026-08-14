@@ -80,9 +80,19 @@ button { font-family: inherit; }
 
 /* ------------------------------------------------------------------ layout */
 
-/* dvh first: on mobile 100vh includes the browser chrome, which cuts off the
+/* The shell is the one bounded box in the console: every pane below scrolls on
+   its own, and `flex: 1; overflow: auto` inside a pane can only mean anything if
+   something above it has a definite height. With min-height alone the shell grew
+   to whatever the tallest pane contained, the PAGE scrolled instead of the pane,
+   and the panel's composer was pushed below the fold — you had to scroll to the
+   bottom of a long agent conversation to reach the chat box.
+   dvh first: on mobile 100vh includes the browser chrome, which cuts off the
    bottom of the panel and makes the layout jump as the address bar hides. */
-.app { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+.app {
+  height: 100vh; height: 100dvh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
 
 .topbar {
   height: 56px; flex: none; display: flex; align-items: center; gap: 12px;
@@ -117,7 +127,10 @@ button { font-family: inherit; }
   display: flex; flex-direction: column;
   min-width: 0; overflow: hidden;
 }
-.panel__scroll { flex: 1; overflow-y: auto; padding: 18px 20px; }
+/* min-height: 0 is load-bearing: a flex child defaults to min-height: auto and
+   refuses to shrink below its content, which would push the composer out of the
+   panel again the moment this stops being a scroll container. */
+.panel__scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 18px 20px; }
 
 /* ------------------------------------------------------- segmented control */
 
@@ -315,7 +328,12 @@ button { font-family: inherit; }
 .composer__hint { font-size: 11px; color: var(--ink-3); margin-top: 7px; }
 
 .turns { display: flex; flex-direction: column; gap: 10px; }
-.turn { font-size: 13px; line-height: 1.55; border-radius: 12px; padding: 9px 12px; max-width: 92%; white-space: pre-wrap; }
+/* overflow-wrap: an agent reply can carry an unbroken 60-character reference,
+   and it has to break inside the bubble rather than widen the panel. */
+.turn {
+  font-size: 13px; line-height: 1.55; border-radius: 12px; padding: 9px 12px;
+  max-width: 92%; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+}
 .turn--fm { align-self: flex-end; background: var(--brand); color: #fff; border-radius: 12px 12px 3px 12px; }
 .turn--agent { align-self: flex-start; background: var(--canvas); border: 1px solid var(--hairline); border-radius: 12px 12px 12px 3px; }
 .turn--error { align-self: flex-start; background: var(--critical-tint); color: var(--critical-ink); }
@@ -396,7 +414,9 @@ kbd {
 @media (max-width: 1100px) {
   .cockpit { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
   .panel {
-    position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 94vw);
+    /* height in dvh, not bottom:0, so the composer sits above the browser's own
+       bottom chrome rather than behind it. bottom:0 stays as the fallback. */
+    position: fixed; top: 0; right: 0; bottom: 0; height: 100dvh; width: min(420px, 94vw);
     z-index: 60; box-shadow: -10px 0 40px rgba(16, 19, 23, 0.16);
     transform: translateX(100%); transition: transform var(--ease); visibility: hidden;
   }
@@ -411,7 +431,10 @@ kbd {
 
   /* One document scroll, not nested ones. Independent overflow panes are right on
      desktop but on a phone they fight the browser's own scrolling and can collapse
-     the list to zero height. */
+     the list to zero height. So the shell goes back to growing with its content —
+     the panel keeps its own bounded height because it is a fixed slide-over here,
+     which is what keeps the composer pinned on a phone. */
+  .app { height: auto; min-height: 100vh; min-height: 100dvh; overflow: visible; }
   .surface { overflow-y: visible; padding: 14px 12px 32px; }
   .surface__inner { max-width: 100%; }
 

@@ -566,7 +566,225 @@ function permitEvidence(c) {
       ai_note: blank + " of " + total + " pre-work checks have no notes; " + signed + " signed off, " + eviNote + "." };
   }
   return { flag: total + "/" + total + " checks evidenced", tone: "#0059D6",
-    ai_note: "All " + total + " pre-work checks have notes (" + signed + " signed off) — notes only, " + eviNote + "." };
+    ai_note: "All " + total + " pre-work checks have notes (" + signed + " signed off) — " + (files ? "" : "notes only, ") + eviNote + "." };
+}
+
+// ---- work-permit approval suggestion ---------------------------------------
+// The FM asked the card to say whether a permit CAN BE APPROVED, not just how
+// much paperwork exists. It now does — as a suggestion, never as a decision.
+// Two things produce it and they are deliberately different in kind:
+//
+//   1. A DETERMINISTIC FLOOR computed from the checklist itself. It answers the
+//      one question a language model cannot be trusted with here: is there
+//      anything on this permit that could corroborate what the notes assert?
+//   2. A REAL AI VERDICT from the standalone Review Work Permits agent (Flow AI
+//      6390) — the same agent the panel's deep read uses, so the suggestion
+//      inherits its safety contract rather than a second, weaker one.
+//
+// The floor can only make the suggestion MORE cautious, never less:
+//     final = max(floor, ai)   on approve < review < reject
+// and "approve" additionally requires the agent to have actually said so — an
+// unanswered agent yields "Needs review", never a green light by default. That
+// clamp is load-bearing on this org's data: asked about the Electrical permits
+// the agent returns APPROVE, but not one permit in the queue has a single
+// evidence file attached and every note merely restates its own question, so
+// the console holds those at review and says why. Nothing here writes, and the
+// Approve/Reject buttons remain entirely the FM's.
+
+const PERMIT_REVIEW_AGENT = "review_work_permits";
+// Measured 8–14s per verdict against the live agent; 20s gives the slow end room
+// without letting a stuck run hold the page open.
+const PERMIT_REVIEW_TIMEOUT_MS = 20000;
+// shapeKey -> { verdict, reason }. Permits whose checklists are byte-identical
+// get one agent call between them, so the whole 51-permit queue costs at most
+// two verdicts instead of fifty-one; the cache then makes a warm page free.
+const PERMIT_VERDICT_CACHE = new Map();
+
+const VERDICT_RANK = { approve: 0, review: 1, reject: 2 };
+
+/** The thread id, wherever the chat envelope put it. */
+function threadIdOf(resp) {
+  if (!resp || typeof resp !== "object") return null;
+  for (const k of ["id", "threadId", "thread_id"]) if (typeof resp[k] === "number") return resp[k];
+  for (const n of [resp.data, resp.output, resp.result, resp.thread]) {
+    if (n && typeof n === "object") {
+      const t = threadIdOf(n);
+      if (t) return t;
+    }
+  }
+  return null;
+}
+
+/** The agent's prose reply, wherever the chat envelope put it. */
+function chatReplyOf(resp) {
+  if (!resp) return null;
+  if (typeof resp === "string") return resp;
+  for (const c of [resp.content, resp.message, resp.reply, resp.text, resp.response]) {
+    if (typeof c === "string" && c.trim()) return c;
+  }
+  for (const n of [resp.data, resp.output, resp.result]) {
+    if (n && typeof n === "object") {
+      const r = chatReplyOf(n);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+/** FNV-1a over the checklist's content. No crypto dependency, stable per run. */
+function permitShapeKey(c) {
+  const pre = Array.isArray(c && c.pre_work_checklist) ? c.pre_work_checklist : [];
+  const s = JSON.stringify([String((c && c.permit_type) || ""), pre.map((i) => [
+    i.section, i.question, i.compulsory, i.already_signed_off_by_a_reviewer,
+    i.notes_written_by_the_person_who_filled_it_in, i.notes_written_by_a_previous_reviewer,
+    i.evidence_files_attached,
+  ])]);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16) + ":" + s.length;
+}
+
+const NOTE_STOPWORDS = new Set(["a", "an", "the", "is", "are", "was", "were", "be", "been", "has",
+  "have", "had", "and", "or", "of", "to", "in", "on", "at", "for", "with", "all", "any", "this",
+  "that", "it", "its", "as", "by", "from", "not", "no", "if", "will", "been", "completed", "done"]);
+function words(s) {
+  return String(s || "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w && !NOTE_STOPWORDS.has(w));
+}
+/**
+ * Does this note record anything the question did not already say? A note that
+ * echoes its own question back ("Equipment is Earthed" -> "Confirmed equipment
+ * earthed") proves that a box was ticked, not that the control was applied; a
+ * note carrying a reading, an isolation point, a tag number or a name does.
+ * Purely lexical and deliberately generous — it only claims "adds nothing" when
+ * essentially every content word is already in the question.
+ */
+function noteAddsInfo(question, note) {
+  const nw = words(note);
+  if (!nw.length) return false;
+  if (/\d/.test(String(note || ""))) return true;   // a reading, a tag, a time, a count
+  const qw = new Set(words(question));
+  const novel = nw.filter((w) => !qw.has(w) && !qw.has(w.replace(/(ed|s)$/, "")));
+  return novel.length / nw.length > 0.4;
+}
+
+/**
+ * Ask the Review Work Permits agent for one permit's verdict. Read-only by
+ * instruction as well as by intent: the agent is told, in the message it will
+ * still be holding later in the thread, that it must not approve, reject, sign
+ * off or modify anything. Returns null on timeout or any failure — an absent
+ * verdict downgrades the card, it never fabricates one.
+ */
+async function askPermitReviewer(permitId) {
+  const ask =
+    "CLASSIFY ONLY - READ-ONLY REQUEST. Do NOT approve, reject, sign off, comment on or modify " +
+    "this permit or any other record, now or later in this thread. Do not call any tool that writes.\n\n" +
+    "Read work permit id " + permitId + " with your checklist tool and judge THAT permit's pre-work evidence only.\n\n" +
+    "Reply with exactly two lines and nothing else:\n" +
+    "VERDICT: <APPROVE|REVIEW|REJECT>\n" +
+    "REASON: <one sentence under 25 words, citing only the pre-work checklist evidence you saw>\n\n" +
+    "Do not name the permit, its number, title, site, contractor or dates in your reason - cite only the " +
+    "checklist questions, their notes and any attached evidence, because this reason is shown against every " +
+    "permit carrying an identical checklist.\n\n" +
+    "Use APPROVE only if the recorded pre-work evidence is sufficient, on its own, for the FM to sign this " +
+    "permit as it stands.\n" +
+    "Use REVIEW if evidence is recorded but cannot be verified from the record.\n" +
+    "Use REJECT if the pre-work evidence is absent, or so incomplete that the permit should be sent back to " +
+    "the contractor.";
+  const run = (async () => {
+    const thread = await callAction("facilio-ai-studio", "create-chat-thread", {
+      agent: PERMIT_REVIEW_AGENT,
+      title: "FM 360 Console · permit suggestion " + permitId,
+    });
+    const threadId = threadIdOf(thread);
+    if (!threadId) return null;
+    const reply = chatReplyOf(await callAction("facilio-ai-studio", "run-agent-chat",
+      { threadId, agent: PERMIT_REVIEW_AGENT, message: ask }));
+    const v = /VERDICT\s*:\s*(APPROVE|REVIEW|REJECT)/i.exec(reply || "");
+    if (!v) return null;
+    const r = /REASON\s*:\s*([\s\S]+)/i.exec(reply || "");
+    return {
+      verdict: v[1].toLowerCase(),
+      reason: r ? r[1].trim().replace(/\s+/g, " ").slice(0, 220) : "",
+    };
+  })();
+  // A dead or slow agent must cost the page nothing worse than a missing verdict,
+  // so every failure mode collapses to null here: the run itself can never reject,
+  // and a runtime without timers simply skips the deadline rather than throwing on
+  // the way to it — nothing in this path may be allowed to fail the whole bucket.
+  const guarded = run.catch(() => null);
+  if (typeof setTimeout !== "function") return guarded;
+  let timer = null;
+  const bail = new Promise((res) => { timer = setTimeout(() => res(null), PERMIT_REVIEW_TIMEOUT_MS); });
+  const out = await Promise.race([guarded, bail]);
+  try { if (timer != null && typeof clearTimeout === "function") clearTimeout(timer); } catch { /* nothing to clear */ }
+  return out;
+}
+
+/**
+ * checklist payload (+ optional agent verdict) -> { flag, tone, ai_note }.
+ *
+ * The floor, in order:
+ *   no pre-work checklist at all -> review  (a config gap, not the contractor's fault)
+ *   not one item carries notes   -> reject  (nothing exists to approve against)
+ *   some items carry no notes    -> review  (incomplete)
+ *   every item noted, but no evidence file AND no note adds anything its own
+ *   question did not already say -> review  (uncorroborated)
+ *   otherwise                    -> approve is permitted, if the agent says so
+ */
+function permitSuggestion(c, ai) {
+  const base = permitEvidence(c);
+  if (!base) return null;   // not a checklist read — stay untagged rather than guess
+  const pre = Array.isArray(c.pre_work_checklist) ? c.pre_work_checklist : [];
+  const total = Number.isFinite(c.pre_work_items_total) ? c.pre_work_items_total : pre.length;
+  const noted = pre.filter((i) => String(i.notes_written_by_the_person_who_filled_it_in || "").trim()).length;
+  const files = pre.reduce((n, i) => n + (Number(i.evidence_files_attached) || 0), 0);
+  const substantive = pre.some((i) => noteAddsInfo(i.question, i.notes_written_by_the_person_who_filled_it_in));
+
+  let floor, why;
+  if (!total) {
+    floor = "review";
+    why = "There is nothing recorded here that could support approving it.";
+  } else if (!noted) {
+    floor = "reject";
+    why = "Send it back to the contractor rather than approve it.";
+  } else if (noted < total) {
+    floor = "review";
+    why = "Get the missing checks filled in before you approve.";
+  } else if (!files && !substantive) {
+    floor = "review";
+    why = "Every note only restates its own question, so nothing corroborates them — confirm on site before you approve.";
+  } else {
+    floor = "approve";
+    why = "";
+  }
+
+  // The agent may only add caution. "approve" additionally needs the agent to
+  // have said it — silence is never a green light.
+  const aiRank = ai ? VERDICT_RANK[ai.verdict] : null;
+  let verdict = floor;
+  if (aiRank != null && aiRank > VERDICT_RANK[floor]) verdict = ai.verdict;
+  if (verdict === "approve" && !(ai && ai.verdict === "approve")) verdict = "review";
+
+  let flag, tone;
+  if (ai) {
+    flag = verdict === "approve" ? "AI suggests: approve"
+      : verdict === "reject" ? "AI suggests: reject" : "AI suggests: review first";
+  } else {
+    flag = verdict === "reject" ? "No evidence — do not approve" : "Needs review";
+  }
+  tone = verdict === "approve" ? "#0F6F06" : verdict === "reject" ? "#B61919" : "#FFD405";
+
+  if (verdict === "approve") why = "The reviewer agent found no gap — confirm it and approve if you are satisfied.";
+  let provenance;
+  if (!ai) {
+    provenance = "(Evidence read only — the AI reviewer did not answer in time.)";
+  } else if (aiRank < VERDICT_RANK[verdict]) {
+    provenance = "(AI reviewer read this checklist as approvable; held at review on the evidence above.)";
+  } else {
+    provenance = "AI reviewer on this checklist: " + (ai.reason || "no reason given") ;
+  }
+
+  return { flag, tone, ai_note: [base.ai_note, why, provenance].filter(Boolean).join(" ") };
 }
 
 // ============================================================================
@@ -584,6 +802,261 @@ function permitEvidence(c) {
 const TSR_STATE_NEW = "Open";
 const TSR_STATE_ACK = "tsrvalidated";
 const TSR_STATES = [TSR_STATE_NEW, TSR_STATE_ACK];
+
+// ============================================================================
+// TSR NEXT STEP — where this request has actually got to, not where its state
+// says it is. VERIFIED against org 2931 (Team V, US) on 2026-08-14.
+//
+// The chain the FM works is
+//     acknowledge -> work order -> procurement initiation -> RFQ
+// but a service request's `moduleState` only distinguishes the FIRST hop
+// (Open vs tsrvalidated). Everything after it lives on OTHER modules, so the
+// later steps can only be derived by looking for the records themselves.
+//
+// WHICH LINKS ACTUALLY EXIST (all counted over the full live module):
+//   • SR <- WO   workorder.associated_tsrs_workorder — MULTI_LOOKUP to
+//                serviceRequest, POPULATED on 11 of 283 work orders, pointing at
+//                5 distinct requests. This is the ONLY real SR<->WO link.
+//                workorder.servicerequestid is a STRING carrying the same id on
+//                9 of 283, and on every one of those it agrees with the lookup —
+//                a strict subset, kept below only as a free fallback.
+//                The service request module has NO field pointing at a work
+//                order (44 fields, none a workorder lookup), so this join can
+//                only ever be read from the WORK ORDER side.
+//   • WO <- PI   custom_procurementinitiation.workorder_custom_procurementinitiation
+//                — LOOKUP to workorder, POPULATED on all 21 procurement
+//                initiations, covering 6 distinct work orders. The reverse field
+//                workorder.associated_procurement_activity_workorder is EMPTY on
+//                all 283, so PI->WO is the only direction carrying data.
+//   • PI <- RFQ  custom_procurementactivity ("Tender Activity") is the org's RFQ
+//                record. It links back with
+//                procurement_initiation_custom_procurementactivity (LOOKUP to
+//                custom_procurementinitiation) and work_order_custom_procurementactivity
+//                (LOOKUP to workorder). The module IS queryable — it returns
+//                success with count 0 — but holds ZERO records org-wide today.
+//                (`requestForQuotation` is not a module in this org at all; the
+//                RFQ lives here.)
+//
+// WHAT CANNOT BE PUSHED SERVER-SIDE: `associated_tsrs_workorder` is a
+// MULTI_LOOKUP and the backend rejects EVERY filter form against it —
+// `associated_tsrs_workorder=<ids>` and `(is_not_empty)=true` both fail with
+// "Unknown column 'WorkOrders.null' in 'where clause'" (the same fault the spot
+// bucket hits on reason_for_reopening_workorder). So the work orders have to be
+// paged and inverted here. The PI filter DOES work
+// (`workorder_custom_procurementinitiation=<ids>` was honoured), and so does the
+// tender-activity one, so those two reads are narrowed to the ids in hand.
+//
+// IS THE WORK BOUGHT IN? Procurement is skipped unless the work has to be
+// sourced externally, and the request itself says which it is:
+// `tenant_quote_path_serviceRequest` is "Procure Vendor Quotes" (external — a
+// procurement initiation follows) or "Provide In-House CBRE Quote" (in house —
+// no procurement at all). It is set on only 14 of the 155 rows in the queue, so
+// when it is absent the suggestion says procurement is conditional rather than
+// claiming a step it cannot stand behind. This is a field read, NOT a judgement
+// call — no model is asked to guess it.
+const TSR_QUOTE_IN_HOUSE = "Provide In-House CBRE Quote";
+const TSR_QUOTE_VENDOR = "Procure Vendor Quotes";
+// custom_procurementinitiation.procurement_process_custom_procurementinitiation
+// ("Procurement Pathway") — the literal RFQ-or-RFT choice. Populated on 1 of 21.
+const PI_PATHWAY_RFQ = "RFQ";
+const PI_PATHWAY_RFT = "RFT";
+// custom_procurementinitiation.procurement_pathway_custom_procurementinitiation
+// ("Procurement Process"). Single sourcing names one vendor up front, so that
+// route never raises a competitive RFQ.
+const PI_PROCESS_SINGLE = "Single Sourcing Process";
+// Work orders can only be found by paging (see above). 283 today = 2 pages; the
+// cap leaves headroom without ever becoming unbounded.
+const TSR_WO_SCAN_PAGES = 4;
+
+/* ---- PURE-TSRNEXT-START — no I/O; extracted verbatim and exercised by the
+   offline verifier against real Facilio payloads. ---- */
+
+// SR id -> the work orders that name it. Reads the MULTI_LOOKUP first and falls
+// back to the legacy `servicerequestid` string, which today is always a subset.
+function tsrWorkOrdersBySr(woRecords) {
+  const m = new Map();
+  const add = (srId, wo) => {
+    if (!srId) return;
+    if (!m.has(srId)) m.set(srId, []);
+    if (m.get(srId).indexOf(wo) < 0) m.get(srId).push(wo);
+  };
+  for (const w of woRecords || []) {
+    for (const t of w.associated_tsrs_workorder || []) add(lookupId(t), w);
+    const legacy = Number(w.servicerequestid);
+    if (legacy) add(legacy, w);
+  }
+  return m;
+}
+// WO id -> its LIVE procurement initiations. A cancelled or rejected PI is not a
+// procurement, so it must not make the card claim procurement has happened.
+function tsrLivePisByWo(piRecords) {
+  const m = new Map();
+  for (const p of piRecords || []) {
+    if (PI_DEAD_STATES.indexOf(String(nameOf(p.moduleState) || p.moduleState || "")) >= 0) continue;
+    const id = lookupId(p.workorder_custom_procurementinitiation);
+    if (!id) continue;
+    if (!m.has(id)) m.set(id, []);
+    m.get(id).push(p);
+  }
+  return m;
+}
+// PI id -> the tender activities (RFQs) raised against it.
+function tsrRfqsByPi(taRecords) {
+  const m = new Map();
+  for (const t of taRecords || []) {
+    const id = lookupId(t.procurement_initiation_custom_procurementactivity);
+    if (!id) continue;
+    if (!m.has(id)) m.set(id, []);
+    m.get(id).push(t);
+  }
+  return m;
+}
+// Newest by record id. Work order #283 carries NINE procurement initiations of
+// three different processes (demo data), so "which one are we on" has to be
+// decided rather than guessed at random — the most recently created wins.
+function tsrNewest(list) {
+  let best = null;
+  for (const r of list || []) if (!best || Number(r.id) > Number(best.id)) best = r;
+  return best;
+}
+function tsrWoRef(wo) {
+  if (!wo) return "the work order";
+  return "WO-" + (wo.serialNumber || wo.id);
+}
+
+// THE STATE MACHINE. Returns { key, note, action } where `action` is the primary
+// button this row should now carry, or null to leave the row with no primary.
+// `key` exists so the offline verifier can count the distribution.
+//
+// Every branch states only what the records prove. Where a link cannot be
+// resolved the wording degrades to what IS known instead of naming a later step
+// — in particular "raise the RFQ" is NEVER produced unless a live procurement
+// initiation for this request was actually read back.
+function tsrNextStep(row, idx) {
+  const qp = String(row.quote_path || "");
+  if (!row.acknowledged) {
+    return {
+      key: "acknowledge",
+      note: "Next: acknowledge this request. The work order follows in the same chat once it is validated.",
+      action: {
+        label: "Acknowledge & proceed", kind: "primary", act: "agent", intent: "tsr_flow",
+        prompt: "Acknowledge this tenant service request, then raise the work order for it.",
+      },
+    };
+  }
+
+  const wos = (idx.srToWo.get(Number(row.sr_id)) || []);
+  if (!wos.length) {
+    if (qp === TSR_QUOTE_IN_HOUSE) {
+      return {
+        key: "tenant_quote",
+        note: "Acknowledged, and the tenant is being quoted in house — next: send the tenant quote. No work order until the quote is accepted.",
+        action: { label: "Create Tenant Quote", kind: "primary", act: "quote" },
+      };
+    }
+    return {
+      key: "work_order",
+      note: qp === TSR_QUOTE_VENDOR
+        ? "Acknowledged, no work order yet — next: raise the work order. Vendor quotes are being procured, so a procurement initiation follows it."
+        : "Acknowledged, no work order yet — next: raise the work order.",
+      action: {
+        label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order",
+        prompt: "Raise the work order for this request.",
+      },
+    };
+  }
+
+  // A work order exists, so "create the work order" is a step already done and
+  // must never be offered again — that button would raise a duplicate.
+  //
+  // The steps below all still open the SAME agent panel: the team takes
+  // procurement and the RFQ conversationally in the thread the work order was
+  // raised in, and start_async already appends the procurement policy and the
+  // RFQ line-item rules to every SR-team briefing. `create_work_order` is used
+  // because it is the only intent whose thread pre-fetches the procurement
+  // context — but it is NOT a perfect fit: agent_bridge owns the opening text
+  // for each intent, and a `continue_procurement` intent belongs there. That is
+  // a change to agent_bridge.js, which is out of scope here, so the label and
+  // the prompt below carry the correction instead. See the report.
+  const wo = tsrNewest(wos);
+  const ref = tsrWoRef(wo);
+  const pis = [];
+  for (const w of wos) for (const p of idx.woToPi.get(Number(w.id)) || []) pis.push(p);
+
+  if (!pis.length) {
+    if (qp === TSR_QUOTE_IN_HOUSE) {
+      return {
+        key: "no_procurement",
+        note: ref + " is raised and the work is being done in house — no procurement initiation is needed on this request.",
+        action: null,
+      };
+    }
+    if (qp === TSR_QUOTE_VENDOR) {
+      return {
+        key: "procurement",
+        note: ref + " is raised and the work is bought in (vendor quotes) — next: raise the procurement initiation.",
+        action: {
+          label: "Initiate procurement", kind: "primary", act: "agent", intent: "create_work_order",
+          prompt: ref + " is already raised for this request — do not raise another. Continue with the procurement initiation for it.",
+        },
+      };
+    }
+    // No quote path on the record, so whether this is bought in is genuinely
+    // unknown. Say that rather than assert a procurement step.
+    return {
+      key: "procurement_unconfirmed",
+      note: ref + " is raised. No quote path is set on this request, so raise a procurement initiation only if the work is bought in.",
+      action: {
+        label: "Continue this request", kind: "primary", act: "agent", intent: "create_work_order",
+        prompt: ref + " is already raised for this request — do not raise another. Continue from there.",
+      },
+    };
+  }
+
+  const pi = tsrNewest(pis);
+  const piIds = pis.map((p) => Number(p.id));
+  const raised = piIds.some((id) => (idx.piToRfq.get(id) || []).length > 0);
+  if (raised) {
+    return {
+      key: "rfq_raised",
+      note: ref + " is raised, procurement is initiated and the RFQ is already out — nothing further for this queue.",
+      action: null,
+    };
+  }
+
+  const pathway = String(pi.procurement_process_custom_procurementinitiation || "");
+  const process = String(pi.procurement_pathway_custom_procurementinitiation || "");
+  const via = process ? " (" + process + ")" : "";
+  if (pathway === PI_PATHWAY_RFT) {
+    return {
+      key: "rft",
+      note: "Procurement is initiated on the RFT pathway" + via + " — next: raise the RFT, not an RFQ.",
+      action: {
+        label: "Raise the RFT", kind: "primary", act: "agent", intent: "create_work_order",
+        prompt: ref + " and its procurement initiation already exist — do not raise either again. Continue with the RFT for it.",
+      },
+    };
+  }
+  if (pathway !== PI_PATHWAY_RFQ && process === PI_PROCESS_SINGLE) {
+    return {
+      key: "single_source",
+      note: "Procurement is initiated on the single-sourcing route — the vendor is named up front, so no RFQ is raised on this path.",
+      action: {
+        label: "Continue procurement", kind: "primary", act: "agent", intent: "create_work_order",
+        prompt: ref + " and its procurement initiation already exist — do not raise either again. Continue with the single-sourcing award.",
+      },
+    };
+  }
+  return {
+    key: "rfq",
+    note: "Procurement is initiated" + via + " — next: raise the RFQ.",
+    action: {
+      label: "Raise the RFQ", kind: "primary", act: "agent", intent: "create_work_order",
+      prompt: ref + " and its procurement initiation already exist — do not raise either again. Continue with the RFQ for it.",
+    },
+  };
+}
+/* ---- PURE-TSRNEXT-END ---- */
 
 const BUCKETS = {
   // ONE queue for the whole tenant service request, not one per state. The FM used
@@ -669,8 +1142,106 @@ const BUCKETS = {
         created_time: r.sysCreatedTime || "",
         record_url: url,
         system_modified_time: r.sysModifiedTime || "",
+        // What enrichPage needs to work out the record's real next step: the raw
+        // record id for the work-order join, and the two values the state machine
+        // reads. Carried on the row rather than re-fetched.
+        sr_id: id, quote_path: qp, acknowledged,
         actions,
       };
+    },
+    // The next-step suggestion is computed per VISIBLE PAGE, never in toRow:
+    // toRow also backs the 30-second counts poll, and answering "does a work
+    // order exist for this request" needs the work-order module paged (the
+    // MULTI_LOOKUP cannot be filtered server-side — see TSR NEXT STEP above).
+    // Doing that every 30s for a number nobody reads would be indefensible.
+    //
+    // COST, per page open, for a page of 10:
+    //   • no acknowledged row on the page → 0 extra calls. Unacknowledged rows
+    //     need "acknowledge" whatever the other modules say, and 136 of the 155
+    //     rows in this queue are unacknowledged, so most pages pay nothing.
+    //   • otherwise 2 calls to page the work orders (283 records today).
+    //   • +1 for the procurement initiations, and only when a visible row
+    //     actually has a work order — and narrowed to those work-order ids,
+    //     because that filter IS honoured server-side.
+    //   • +1 for the tender activities (RFQs), only when a live procurement
+    //     initiation was found, narrowed to those ids.
+    // Worst case 4 calls for the whole page; never one per row.
+    //
+    // Deliberately deterministic — no model call. The chain is a state machine
+    // over records that either exist or do not, and "is this work bought in" is
+    // a field on the request (`tenant_quote_path_serviceRequest`), not a
+    // judgement. An LLM here would cost a round trip per page to restate a join,
+    // and could invent a step that has not happened.
+    async enrichPage(jobs) {
+      const rows = jobs || [];
+      // Baseline first: every row gets the suggestion its own state supports, so
+      // a failed read downgrades to an honest line instead of leaving a blank.
+      const empty = { srToWo: new Map(), woToPi: new Map(), piToRfq: new Map() };
+      for (const row of rows) {
+        const step = tsrNextStep(row, empty);
+        row.ai_note = step.note;
+      }
+      if (!rows.some((r) => r.acknowledged)) return;
+
+      try {
+        const wos = [];
+        for (let page = 1; page <= TSR_WO_SCAN_PAGES; page++) {
+          const { records } = envelope(await callAction("facilio-cmms", "list-work-orders", {
+            page, page_size: 200,
+            select: "id,serialNumber,associated_tsrs_workorder,servicerequestid",
+          }));
+          wos.push(...records);
+          if (records.length < 200) break;
+        }
+        const srToWo = tsrWorkOrdersBySr(wos);
+
+        // Only the work orders belonging to rows ON THIS PAGE are worth asking
+        // about — the PI filter takes ids, so ask for exactly those.
+        const woIds = [];
+        for (const row of rows) {
+          for (const w of srToWo.get(Number(row.sr_id)) || []) {
+            if (woIds.indexOf(Number(w.id)) < 0) woIds.push(Number(w.id));
+          }
+        }
+        let woToPi = new Map();
+        let piToRfq = new Map();
+        if (woIds.length) {
+          woToPi = tsrLivePisByWo(envelope(await callAction("facilio-cmms", "list-custom-module-records", {
+            custom_module: "custom_procurementinitiation", page_size: 200,
+            filters: "workorder_custom_procurementinitiation=" + woIds.join(","),
+            select: "id,moduleState,workorder_custom_procurementinitiation," +
+              "procurement_process_custom_procurementinitiation,procurement_pathway_custom_procurementinitiation",
+          })).records);
+
+          const piIds = [];
+          for (const list of woToPi.values()) for (const p of list) piIds.push(Number(p.id));
+          if (piIds.length) {
+            // The RFQ read is what stops the card claiming "raise the RFQ" for a
+            // request whose RFQ is already out. Tender Activity holds no records
+            // in this org today, so this returns empty — but it is asked anyway,
+            // because guessing that answer is exactly the mistake to avoid.
+            piToRfq = tsrRfqsByPi(envelope(await callAction("facilio-cmms", "list-custom-module-records", {
+              custom_module: "custom_procurementactivity", page_size: 200,
+              filters: "procurement_initiation_custom_procurementactivity=" + piIds.join(","),
+              select: "id,moduleState,procurement_initiation_custom_procurementactivity",
+            })).records);
+          }
+        }
+
+        const idx = { srToWo, woToPi, piToRfq };
+        for (const row of rows) {
+          const step = tsrNextStep(row, idx);
+          row.ai_note = step.note;
+          // The button must never offer a step the records show is already done.
+          // Replace the primary in place; View and everything else stay as they
+          // are, and a null action means this row has no primary left.
+          const rest = (row.actions || []).filter((a) => a.kind !== "primary");
+          row.actions = step.action ? [step.action].concat(rest) : rest;
+        }
+      } catch {
+        // A failed join leaves the baseline notes above in place. An honest
+        // "acknowledged — raise the work order" beats a guessed "raise the RFQ".
+      }
     },
   },
   unblock: {
@@ -725,16 +1296,42 @@ const BUCKETS = {
     // a number nobody reads. Ten reads when a page is actually opened is the
     // cheap, honest place for it.
     async enrichPage(jobs) {
-      await Promise.all(jobs.map(async (row) => {
+      // 1. Every visible permit's checklist, in parallel — the evidence the
+      //    suggestion is computed from, and the only read that always happens.
+      const reads = await Promise.all(jobs.map(async (row) => {
         try {
           const resp = await callAction("cbre-clone", "get-work-permit-with-checklist", { permit_id: row.permit_id });
-          const tag = permitEvidence(unwrapChecklist(resp));
-          if (tag) { row.flag = tag.flag; row.tone = tag.tone; row.ai_note = tag.ai_note; }
+          return { row, c: unwrapChecklist(resp) };
         } catch {
           // A failed checklist read must leave the card untagged rather than
           // tagged wrongly — an absent badge is honest, a guessed one is not.
+          return { row, c: null };
         }
       }));
+
+      // 2. ONE agent verdict per DISTINCT checklist, not one per permit. Across
+      //    this queue fifty Electrical permits carry byte-identical checklists,
+      //    so fifty identical questions would be fifty identical answers; the
+      //    shape key collapses them to a single call whose reason is worded to
+      //    stand for any permit carrying that checklist. Cached for the process,
+      //    so a second page of the same permit type costs nothing.
+      const wanted = new Map();
+      for (const { row, c } of reads) {
+        if (!c) continue;
+        const key = permitShapeKey(c);
+        if (!PERMIT_VERDICT_CACHE.has(key) && !wanted.has(key)) wanted.set(key, row.permit_id);
+      }
+      await Promise.all([...wanted].map(async ([key, permitId]) => {
+        const v = await askPermitReviewer(permitId);
+        if (v) PERMIT_VERDICT_CACHE.set(key, v);
+      }));
+
+      // 3. Suggest — never decide. The Approve/Reject buttons are untouched.
+      for (const { row, c } of reads) {
+        if (!c) continue;
+        const tag = permitSuggestion(c, PERMIT_VERDICT_CACHE.get(permitShapeKey(c)) || null);
+        if (tag) { row.flag = tag.flag; row.tone = tag.tone; row.ai_note = tag.ai_note; }
+      }
     },
   },
   referral: {
@@ -1135,6 +1732,10 @@ server.addHandler({
       rawTotal = count || records.length;
     }
     const total = Math.max(0, rawTotal - hiddenCount(d, id, b.aliases));
+    // Same per-page enrichment the custom path gets, for buckets whose rows come
+    // from a live query (tsr). Outside loadRows/toRow by design: this handler
+    // runs on page open, the counts poll does not reach it.
+    if (b.enrichPage) await b.enrichPage(jobs);
     return { bucket: id, jobs, page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)), ranAt: nowIso() };
   },
 });
@@ -1183,12 +1784,78 @@ server.addHandler({
   },
 });
 
+// ---- permit approve / reject ------------------------------------------------
+// The connections gateway answers HTTP 200 even when the action refused the
+// write, putting the refusal in the BODY as {success:false, error:{...}}.
+// callAction() only throws on a non-2xx status, so a refused write used to look
+// exactly like a successful one. Verified live against the old call path:
+//
+//   facilio-cmms.change-permit-status {work_permit_id:4781, permit_status:"Permit Approved"}
+//     -> 200 {"success":false,"error":{"code":"VALIDATION_ERROR",
+//              "message":"Status 'Permit Approved' does not exist for module 'workpermit'"}}
+//
+// ...and permit 4781 did not move. Anything that writes must therefore read the
+// body, not the status line.
+function actionError(resp) {
+  if (!resp || typeof resp !== "object") return null;
+  if (resp.success === false || resp.ok === false) {
+    const e = resp.error;
+    if (e && typeof e === "object") return String(e.message || e.code || JSON.stringify(e)).slice(0, 300);
+    return String(e || resp.message || "the action refused the write").slice(0, 300);
+  }
+  // Some actions report the failure without a success flag at all.
+  if (resp.error && typeof resp.error === "object" && (resp.error.message || resp.error.code)) {
+    return String(resp.error.message || resp.error.code).slice(0, 300);
+  }
+  return null;
+}
+
+/** Call an action and treat an in-body refusal as the failure it is. */
+async function callActionChecked(connectionSlug, actionSlug, input) {
+  const resp = await callAction(connectionSlug, actionSlug, input);
+  const err = actionError(resp);
+  if (err) throw new Error(connectionSlug + "." + actionSlug + " refused: " + err);
+  return resp;
+}
+
+// A rejection reason is kept permanently on the permit and is the only thing the
+// contractor is told. "no" or "rejected" wastes their trip; make the console
+// refuse it here as well as in the dialog, so the rule holds however it's called.
+const VAGUE_REASONS = new Set([
+  "no", "nope", "n/a", "na", "none", "bad", "wrong", "invalid", "reject", "rejected",
+  "not ok", "not approved", "no good", "test", "asdf", "-", ".",
+]);
+function reasonProblem(raw) {
+  const reason = String(raw == null ? "" : raw).trim();
+  if (!reason) return "A rejection reason is required — it is recorded permanently on the permit.";
+  if (VAGUE_REASONS.has(reason.toLowerCase().replace(/[.!]+$/, ""))) {
+    return "That reason is too vague to send back to the contractor. Say which safety items were missing or unsatisfied, and what must be put right.";
+  }
+  // A sentence, not a shrug. "missing stuff fix it" clears 20 chars and 4 words
+  // and still tells the contractor nothing, so the floor sits above it.
+  if (reason.length < 40 || reason.split(/\s+/).filter(Boolean).length < 6) {
+    return "Give a fuller reason (at least a sentence): which safety items were missing or unsatisfied, and what must be put right before the permit is raised again.";
+  }
+  return null;
+}
+
+/** Read a permit's live moduleState back from Facilio. null = could not read. */
+async function readPermitState(permitId) {
+  try {
+    const resp = await callAction("facilio-cmms", "get-work-permit", { work_permit_id: permitId });
+    const rec = (resp && resp.data) || {};
+    const ms = rec.moduleState;
+    return { state: String((ms && ms.status) || ms || ""), permitStatus: rec.permitStatus == null ? "" : String(rec.permitStatus) };
+  } catch { return null; }
+}
+
 server.addHandler({
   name: "permit_decision",
-  description: "Approve or reject a work permit awaiting FM approval, then drop it from the feed. decision = 'approve' | 'reject'.",
+  description: "Approve or reject a work permit awaiting FM approval, verify the record actually moved, then drop it from the feed. decision = 'approve' | 'reject'. reject requires rejection_reason.",
   parameters: {
     external_id: { description: "external_id (unblock:workpermit:<id>)", type: "string" },
     decision: { description: "'approve' or 'reject'", type: "string" },
+    rejection_reason: { description: "Required when decision='reject'. Kept permanently on the permit.", type: "string" },
     actor: { description: "Optional name/email of who decided", type: "string" },
   },
   execute: async (args) => {
@@ -1197,20 +1864,55 @@ server.addHandler({
     const permitId = Number(seg[seg.length - 1]);
     const decision = (args.decision || "").toLowerCase();
     if (decision !== "approve" && decision !== "reject") throw new Error("decision must be 'approve' or 'reject'");
-    const permit_status = decision === "approve" ? "Permit Approved" : "Permit Rejected";
 
-    let syncStatus = "synced", syncError = null;
+    const reason = String(args.rejection_reason == null ? "" : args.rejection_reason).trim();
+    if (decision === "reject") {
+      const bad = reasonProblem(reason);
+      // Refused before any write — the card must stay exactly where it is.
+      if (bad) return { ok: false, external_id: args.external_id, error: bad, reason_required: true };
+    }
+
+    const label = decision === "approve" ? "Permit Approved" : "Permit Rejected";
+    const before = await readPermitState(permitId);
+
+    // The approve/reject the FM performs in Facilio is the pre-work sign-off /
+    // refusal on the permit's own review screen, not a raw status poke. These
+    // are the two actions that carry that workflow.
+    let syncError = null;
     try {
-      await callAction("facilio-cmms", "change-permit-status", { work_permit_id: permitId, permit_status });
-    } catch (e) { syncStatus = "failed"; syncError = String(e && e.message ? e.message : e).slice(0, 300); }
+      if (decision === "approve") {
+        await callActionChecked("cbre-clone", "approve-work-permit-pre-work-checks", { permit_id: permitId });
+      } else {
+        await callActionChecked("cbre-clone", "reject-work-permit", { permit_id: permitId, rejection_reason: reason });
+      }
+    } catch (e) { syncError = String(e && e.message ? e.message : e).slice(0, 300); }
 
     const d = db();
-    if (syncStatus === "failed") {
-      upsertState(d, args.external_id, "", permit_status, nowIso(), "failed: " + syncError);
-      return { ok: false, external_id: args.external_id, error: syncError };
+    const now = nowIso();
+    if (syncError) {
+      upsertState(d, args.external_id, "", label, now, "failed: " + syncError);
+      return { ok: false, external_id: args.external_id, error: syncError, before_state: before && before.state };
     }
-    upsertState(d, args.external_id, "true", permit_status, nowIso(), "synced");
-    return { ok: true, external_id: args.external_id, decision, permit_status };
+
+    // Believe the record, not the 200. If the permit is still sitting in
+    // awaitingfmapproval the decision did not land, whatever the call returned —
+    // leave the card in the feed and say so.
+    const after = await readPermitState(permitId);
+    if (after && after.state === "awaitingfmapproval") {
+      const err = "Facilio accepted the call but the permit is still Awaiting FM Approval — the decision did not land.";
+      upsertState(d, args.external_id, "", label, now, "failed: " + err);
+      return { ok: false, external_id: args.external_id, error: err, before_state: before && before.state, after_state: after.state };
+    }
+
+    upsertState(d, args.external_id, "true", label, now, "synced");
+    return {
+      ok: true, external_id: args.external_id, decision, permit_status: label,
+      before_state: before && before.state,
+      // null when the read-back itself failed: the write succeeded, we just
+      // could not re-confirm it. Say that rather than implying we checked.
+      after_state: after ? after.state : null,
+      verified: !!after,
+    };
   },
 });
 

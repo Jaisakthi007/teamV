@@ -165,6 +165,10 @@ export default function App() {
   const [quote, setQuote] = useState(null);
   const [quoteAmount, setQuoteAmount] = useState("");
   const [quoteBusy, setQuoteBusy] = useState(false);
+  const [reject, setReject] = useState(null);         // { job } — reject-reason dialog
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejectError, setRejectError] = useState(null);
+  const [rejectBusy, setRejectBusy] = useState(false);
   const [agent, setAgent] = useState(null); // { job, threadId, turns[], busy }
   const [drill, setDrill] = useState(null);       // { job }
   const [drillData, setDrillData] = useState(null); // { po, lines, autoMatch }
@@ -369,27 +373,10 @@ export default function App() {
     // team, not a one-shot write.
     if (action.act === "agent") { openAgent(job, action); return; }
     if (action.act === "drill") { openDrill(job); return; }
-    if (action.act === "approve" || action.act === "reject") {
-      setActingId(job.external_id);
-      setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
-      setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-      setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-      try {
-        const res = await vibe.executeFunction("feed", "permit_decision", { external_id: job.external_id, decision: action.act, actor });
-        if (res?.ok) {
-          setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}` });
-          flash(`${job.ref} — ${res.permit_status}`); await refreshCounts(); await loadPage(bucket, page);
-        } else {
-          setResult({ id: job.external_id, status: "err", text: res?.error || "Could not complete that." });
-          flash(`Couldn't ${action.label.toLowerCase()}: ${res?.error || "error"}`); await loadPage(bucket, page);
-        }
-      } catch (e) {
-        setResult({ id: job.external_id, status: "err", text: String(e?.message || e) });
-        flash(`${action.label} failed: ` + (e?.message || e)); await loadPage(bucket, page);
-      }
-      finally { setActingId(null); }
-      return;
-    }
+    // Refusing a permit stops a contractor's job, and the reason is kept
+    // permanently on the record — so it is collected first, never blank.
+    if (action.act === "reject") { setReject({ job }); setRejectReason(""); setRejectError(null); return; }
+    if (action.act === "approve") { await decidePermit(job, "approve"); return; }
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
@@ -475,6 +462,67 @@ export default function App() {
     setAgent(null);
     await refreshCounts();
     if (bucket) await loadPage(bucket, page);
+  }
+
+  /**
+   * Approve or reject a work permit for real.
+   *
+   * The card is NOT removed up front. An optimistic removal is only honest when
+   * the write cannot meaningfully fail; this one can — and when it did, the card
+   * vanished while the permit sat untouched in Facilio, which is exactly the bug
+   * this path had. So: hold the card, wait for the handler to confirm the record
+   * actually moved off "Awaiting FM Approval", and only then drop it. Anything
+   * else leaves the card in place with the error on it.
+   */
+  async function decidePermit(job, decision, reason) {
+    setActingId(job.external_id);
+    const label = decision === "approve" ? "Approving" : "Rejecting";
+    setResult({ id: job.external_id, status: "busy", text: label + "…" });
+    try {
+      const res = await vibe.executeFunction("feed", "permit_decision", {
+        external_id: job.external_id, decision, actor,
+        ...(decision === "reject" ? { rejection_reason: reason || "" } : {}),
+      });
+      if (res?.ok) {
+        // Verified: the handler re-read the permit and it had moved.
+        const moved = res.after_state ? ` · now ${res.after_state}` : "";
+        setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}${moved}` });
+        flash(`${job.ref} — ${res.permit_status}${res.verified === false ? " (sent, but could not re-read the permit)" : ""}`);
+        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+        await refreshCounts();
+        if (bucket) await loadPage(bucket, page);
+        return { ok: true };
+      }
+      const err = res?.error || "Could not complete that.";
+      // Nothing was removed, so there is nothing to restore — the card is still
+      // on screen, now carrying the reason it did not go through.
+      setResult({ id: job.external_id, status: "err", text: err });
+      flash(`Couldn't ${decision} ${job.ref}: ${err}`);
+      return { ok: false, error: err };
+    } catch (e) {
+      const err = String(e?.message || e);
+      setResult({ id: job.external_id, status: "err", text: err });
+      flash(`${decision === "approve" ? "Approve" : "Reject"} failed: ` + err);
+      return { ok: false, error: err };
+    } finally { setActingId(null); }
+  }
+
+  async function submitReject() {
+    const job = reject.job;
+    const reason = rejectReason.trim();
+    // Same rule the handler enforces, applied here so the FM finds out before
+    // the round trip rather than after it.
+    if (reason.length < 40 || reason.split(/\s+/).filter(Boolean).length < 6) {
+      setRejectError("Say which safety items were missing or unsatisfied, and what must be put right before the permit is raised again.");
+      return;
+    }
+    setRejectBusy(true); setRejectError(null);
+    try {
+      const res = await decidePermit(job, "reject", reason);
+      if (res?.ok) setReject(null);
+      else setRejectError(res?.error || "Could not reject that permit.");
+    } finally { setRejectBusy(false); }
   }
 
   async function submitQuote() {
@@ -781,6 +829,30 @@ export default function App() {
         </aside>
       </div>
 
+      {reject && (
+        <div onClick={() => !rejectBusy && setReject(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 520, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+            <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 2 }}>Reject permit</div>
+            <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 18 }}>{reject.job.ref} · {reject.job.title}</div>
+            <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--ink-3)" }}>Reason for rejection</label>
+            <textarea
+              autoFocus rows={5} value={rejectReason}
+              onChange={(e) => { setRejectReason(e.target.value); if (rejectError) setRejectError(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitReject(); }}
+              placeholder="e.g. Isolation evidence is missing — no photo of the applied lock/tag and the isolator reference is not recorded. Attach both before resubmitting."
+              style={{ width: "100%", marginTop: 6, padding: "10px 12px", fontSize: 14, lineHeight: 1.5, border: "1px solid " + (rejectError ? "var(--bad, #C0392B)" : "var(--hairline-strong)"), borderRadius: 8, outline: "none", font: "inherit", resize: "vertical" }}
+            />
+            <div style={{ fontSize: 12, color: rejectError ? "var(--bad, #C0392B)" : "var(--ink-3)", marginTop: 8 }}>
+              {rejectError || "This is recorded permanently on the permit and is the only thing the contractor is told. Name the specific safety items that were missing or unsatisfied."}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
+              <button className="btn" disabled={rejectBusy} onClick={() => setReject(null)}>Cancel</button>
+              <button className="btn btn--primary" disabled={rejectBusy || !rejectReason.trim()} onClick={submitReject}>{rejectBusy ? "Rejecting…" : "Reject permit"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {quote && (
         <div onClick={() => !quoteBusy && setQuote(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
           <div onClick={(e) => e.stopPropagation()} style={{ width: 420, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
@@ -892,9 +964,18 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
   const waitLine = useLoaderLine(isPermit ? LOAD_PERMIT : LOAD_AGENT, busy && !agent?.note, 3200);
 
   useEffect(() => vibe.onRealtimeState?.(setRtState), []);
+  // Follow the conversation only while the FM is already at the end of it: a new
+  // turn must never yank them away from an earlier answer they are reading back.
+  // Scrolling to within 48px of the bottom re-arms the follow.
+  const stick = useRef(true);
   useEffect(() => {
     const el = scroller.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el || !stick.current) return;
+    el.scrollTop = el.scrollHeight;
+    // The conversation sits under the record's facts in the panel's own scroll, so
+    // the newest turn also has to be brought into the panel — otherwise the answer
+    // arrives off the bottom of it. "nearest" scrolls the minimum needed.
+    el.scrollIntoView({ block: "nearest" });
   }, [agent?.turns, busy]);
 
   function submit() {
@@ -975,7 +1056,16 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
               <span>{panelTitle}</span>
               <button className="btn btn--ghost btn--sm" onClick={onDismissAgent}>Dismiss</button>
             </div>
-            <div ref={scroller} className="turns" style={{ maxHeight: 320, overflowY: "auto" }}>
+            {/* The transcript scrolls inside itself, and its cap follows the
+                viewport so one very long reply can never fill the whole panel. */}
+            <div
+              ref={scroller} className="turns"
+              style={{ maxHeight: "min(46dvh, 360px)", overflowY: "auto", overscrollBehavior: "contain" }}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+              }}
+            >
               {agent.turns.map((t, i) => <Turn key={i} turn={t} />)}
               {busy && (
                 <div className="turn turn--agent" style={{ color: "var(--brand-ink)", minHeight: 20 }}>

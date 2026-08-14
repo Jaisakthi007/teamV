@@ -764,12 +764,459 @@ function bandByKeyword(li) {
   return "unknown";
 }
 
+/* ---------------- Supporting document as a rate source ----------------
+   The agreement also carries an uploaded rate card in a FILE field. Reading it
+   needs raw DEFLATE, because PDF content streams are Flate-compressed and this
+   sandbox has no zlib, no Buffer and no npm inflate. The implementation below is
+   RFC 1951 by hand; it is verified byte-exact against zlib on the org's real
+   documents. Nothing here fabricates a rate: a document that yields no number
+   yields no baseline, and the structured columns are used instead. */
+
+const RATE_DOC_FIELD = "rate_card_supporting_document_custom_ratecard";
+
+const LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CLORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+function inflateRaw(input) {
+  let pos = 0, bitBuf = 0, bitCnt = 0;
+  const out = [];
+
+  function bits(n) {
+    while (bitCnt < n) {
+      if (pos >= input.length) throw new Error("inflate: input exhausted");
+      bitBuf |= input[pos++] << bitCnt;
+      bitCnt += 8;
+    }
+    const v = bitBuf & ((1 << n) - 1);
+    bitBuf >>>= n;
+    bitCnt -= n;
+    return v;
+  }
+
+  function buildHuff(lengths) {
+    const count = [], offs = [];
+    for (let i = 0; i <= 15; i++) count.push(0);
+    for (let i = 0; i < lengths.length; i++) count[lengths[i]]++;
+    count[0] = 0;
+    for (let i = 0; i <= 16; i++) offs.push(0);
+    for (let len = 1; len <= 15; len++) offs[len + 1] = offs[len] + count[len];
+    const symbols = [];
+    for (let i = 0; i < lengths.length; i++) symbols.push(0);
+    for (let i = 0; i < lengths.length; i++) if (lengths[i]) symbols[offs[lengths[i]]++] = i;
+    return { count, symbols };
+  }
+
+  function decodeSym(h) {
+    let code = 0, first = 0, index = 0;
+    for (let len = 1; len <= 15; len++) {
+      code |= bits(1);
+      const cnt = h.count[len];
+      if (code - first < cnt) return h.symbols[index + (code - first)];
+      index += cnt;
+      first = (first + cnt) << 1;
+      code <<= 1;
+    }
+    throw new Error("inflate: bad huffman code");
+  }
+
+  let fixedLit = null, fixedDist = null;
+  function fixedTables() {
+    if (fixedLit) return;
+    const l = [], d = [];
+    for (let i = 0; i < 288; i++) l.push(i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8);
+    for (let i = 0; i < 30; i++) d.push(5);
+    fixedLit = buildHuff(l);
+    fixedDist = buildHuff(d);
+  }
+
+  function block(lit, dist) {
+    for (;;) {
+      const sym = decodeSym(lit);
+      if (sym < 256) { out.push(sym); continue; }
+      if (sym === 256) return;
+      const si = sym - 257;
+      if (si >= LBASE.length) throw new Error("inflate: bad length code");
+      const len = LBASE[si] + bits(LEXT[si]);
+      const ds = decodeSym(dist);
+      if (ds >= DBASE.length) throw new Error("inflate: bad distance code");
+      const back = DBASE[ds] + bits(DEXT[ds]);
+      if (back > out.length) throw new Error("inflate: distance too far back");
+      const start = out.length - back;
+      for (let i = 0; i < len; i++) out.push(out[start + i]);
+    }
+  }
+
+  for (;;) {
+    const last = bits(1), type = bits(2);
+    if (type === 0) {
+      bitBuf = 0; bitCnt = 0;
+      if (pos + 4 > input.length) throw new Error("inflate: truncated stored block");
+      const len = input[pos] | (input[pos + 1] << 8);
+      pos += 4;
+      if (pos + len > input.length) throw new Error("inflate: truncated stored data");
+      for (let i = 0; i < len; i++) out.push(input[pos++]);
+    } else if (type === 1) {
+      fixedTables();
+      block(fixedLit, fixedDist);
+    } else if (type === 2) {
+      const hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+      const clen = [];
+      for (let i = 0; i < 19; i++) clen.push(0);
+      for (let i = 0; i < hclen; i++) clen[CLORDER[i]] = bits(3);
+      const clh = buildHuff(clen);
+      const lengths = [];
+      while (lengths.length < hlit + hdist) {
+        const sym = decodeSym(clh);
+        if (sym < 16) { lengths.push(sym); continue; }
+        let n, val = 0;
+        if (sym === 16) {
+          if (!lengths.length) throw new Error("inflate: no previous length");
+          val = lengths[lengths.length - 1];
+          n = 3 + bits(2);
+        } else if (sym === 17) { n = 3 + bits(3); } else { n = 11 + bits(7); }
+        while (n--) lengths.push(val);
+      }
+      block(buildHuff(lengths.slice(0, hlit)), buildHuff(lengths.slice(hlit, hlit + hdist)));
+    } else {
+      throw new Error("inflate: bad block type");
+    }
+    if (last) break;
+  }
+
+  const res = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) res[i] = out[i];
+  return res;
+}
+
+// Accepts a zlib-wrapped (RFC 1950) or bare DEFLATE payload.
+function inflateAuto(bytes) {
+  if (bytes.length > 2 && (bytes[0] & 0x0f) === 8 && ((bytes[0] << 8) | bytes[1]) % 31 === 0) {
+    try { return inflateRaw(bytes.subarray(2)); } catch { /* not zlib after all */ }
+  }
+  return inflateRaw(bytes);
+}
+
+function ascii85Decode(str) {
+  let s = String(str).replace(/\s/g, "");
+  if (s.slice(0, 2) === "<~") s = s.slice(2);
+  const end = s.indexOf("~>");
+  if (end >= 0) s = s.slice(0, end);
+  const out = [];
+  let tuple = 0, count = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charAt(i) === "z" && count === 0) { out.push(0, 0, 0, 0); continue; }
+    const c = s.charCodeAt(i) - 33;
+    if (c < 0 || c > 84) continue;
+    tuple = tuple * 85 + c;
+    if (++count === 5) {
+      out.push((tuple / 16777216) & 255, (tuple >>> 16) & 255, (tuple >>> 8) & 255, tuple & 255);
+      tuple = 0; count = 0;
+    }
+  }
+  if (count > 0) {
+    for (let i = count; i < 5; i++) tuple = tuple * 85 + 84;
+    const b = [(tuple / 16777216) & 255, (tuple >>> 16) & 255, (tuple >>> 8) & 255, tuple & 255];
+    for (let i = 0; i < count - 1; i++) out.push(b[i]);
+  }
+  const res = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) res[i] = out[i];
+  return res;
+}
+
+function asciiHexDecode(str) {
+  const s = String(str).replace(/[^0-9A-Fa-f>]/g, "");
+  const out = [];
+  for (let i = 0; i + 1 < s.length; i += 2) {
+    if (s.charAt(i) === ">") break;
+    out.push(parseInt(s.substr(i, 2), 16));
+  }
+  const res = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) res[i] = out[i];
+  return res;
+}
+
+function latin1(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    let part = "";
+    const end = Math.min(i + 8192, bytes.length);
+    for (let j = i; j < end; j++) part += String.fromCharCode(bytes[j]);
+    s += part;
+  }
+  return s;
+}
+
+function bytesFromLatin1(str) {
+  const b = new Uint8Array(str.length);
+  for (let i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 255;
+  return b;
+}
+
+function unescapePdfString(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charAt(i);
+    if (c !== "\\") { out += c; continue; }
+    const n = s.charAt(++i);
+    if (n === "n") out += "\n";
+    else if (n === "r") out += "\r";
+    else if (n === "t") out += "\t";
+    else if (n === "b") out += "\b";
+    else if (n === "f") out += "\f";
+    else if (n >= "0" && n <= "7") {
+      let oct = n;
+      for (let k = 0; k < 2 && i + 1 < s.length; k++) {
+        const d = s.charAt(i + 1);
+        if (d >= "0" && d <= "7") { oct += d; i++; } else break;
+      }
+      out += String.fromCharCode(parseInt(oct, 8) & 255);
+    } else if (n !== "\n") out += n;
+  }
+  return out;
+}
+
+// Show-text operands of a content stream, in drawing order.
+function pdfContentTokens(content) {
+  const tokens = [];
+  const re = /\(((?:\\[\s\S]|[^\\()])*)\)\s*(?:Tj|'|")|\[((?:[^\][]|\\.)*)\]\s*TJ/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    if (m[1] !== undefined) {
+      tokens.push(unescapePdfString(m[1]));
+    } else if (m[2] !== undefined) {
+      const sre = /\(((?:\\[\s\S]|[^\\()])*)\)/g;
+      let sm, joined = "";
+      while ((sm = sre.exec(m[2])) !== null) joined += unescapePdfString(sm[1]);
+      if (joined) tokens.push(joined);
+    }
+  }
+  return tokens;
+}
+
+/* Text of every decodable content stream. Image streams are skipped; a PDF with
+   no text layer (a scan) simply returns no tokens, which the caller treats as
+   "not parseable" rather than as an empty rate card. */
+function pdfTextTokens(bytes) {
+  const s = latin1(bytes);
+  const tokens = [];
+  let idx = 0, streams = 0, decoded = 0;
+  for (;;) {
+    const i = s.indexOf("stream", idx);
+    if (i < 0) break;
+    const dictStart = s.lastIndexOf("<<", i);
+    const dict = dictStart >= 0 ? s.slice(dictStart, i) : "";
+    let st = i + 6;
+    if (s.charAt(st) === "\r") st++;
+    if (s.charAt(st) === "\n") st++;
+    const e = s.indexOf("endstream", st);
+    if (e < 0) break;
+    streams++;
+    const raw = s.slice(st, e);
+    idx = e + 9;
+    if (/\/Image|\/DCTDecode|\/JPXDecode|\/CCITTFaxDecode/.test(dict)) continue;
+    try {
+      let data;
+      if (/ASCII85Decode|\/A85/.test(dict)) data = ascii85Decode(raw);
+      else if (/ASCIIHexDecode|\/AHx/.test(dict)) data = asciiHexDecode(raw);
+      else data = bytesFromLatin1(raw);
+      if (/FlateDecode|\/Fl\b/.test(dict)) data = inflateAuto(data);
+      const t = pdfContentTokens(latin1(data));
+      if (t.length) { decoded++; for (let k = 0; k < t.length; k++) tokens.push(t[k]); }
+    } catch { /* undecodable stream — skip, do not guess */ }
+  }
+  return { tokens, streams, decoded };
+}
+
+/* Band labels as they appear in a written rate card. Ordered: first match wins,
+   so "Saturday" cannot be swallowed by the normal-hours pattern. */
+const DOC_BANDS = [
+  { band: "call_out", re: /call\s*-?\s*out|callout|attendance\s*fee|mobilisation/i },
+  { band: "saturday", re: /saturday|\bsat\b/i },
+  { band: "sunday", re: /sunday|\bsun\b|public\s*holiday/i },
+  { band: "after_hours", re: /after\s*hours|out\s*of\s*hours|overtime|night\s*shift|non[-\s]*business\s*hours/i },
+  { band: "normal_hours", re: /normal\s*hours|ordinary\s*hours|standard\s*(hours|rate)|business\s*hours|mon(day)?\s*[-–—to\s]+\s*fri(day)?/i },
+];
+
+function bandOfLabel(s) {
+  for (let i = 0; i < DOC_BANDS.length; i++) if (DOC_BANDS[i].re.test(s)) return DOC_BANDS[i].band;
+  return null;
+}
+
+// Money-ish number. "Not specified" / "N/A" are absent values, never zero.
+function parseMoney(s) {
+  if (s == null) return null;
+  const t = String(s);
+  if (/not\s*specified|n\/?a\b|nil\b|tbc|tbd|-{2,}/i.test(t)) return null;
+  const m = t.match(/-?\d[\d,]*(?:\.\d+)?/);
+  if (!m) return null;
+  const v = Number(m[0].replace(/,/g, ""));
+  return isFinite(v) ? v : null;
+}
+
+/* Ordered text fragments -> rates. Works for PDF show-text operands and for
+   CSV/text lines alike. Also lifts the provenance line the generator writes. */
+function parseRateCardCells(cells) {
+  const seen = {};
+  for (let i = 0; i < cells.length; i++) {
+    const cell = String(cells[i] == null ? "" : cells[i]);
+    const band = bandOfLabel(cell);
+    if (!band || seen[band] !== undefined) continue;
+    let v = null;
+    const selfTail = cell.replace(/^[^0-9]*/, "");
+    // A same-cell number only counts when the cell is delimited ("Saturday, 120").
+    if (/[,;:\t|]/.test(cell) && parseMoney(selfTail) != null) v = parseMoney(selfTail);
+    if (v == null) {
+      for (let k = 1; k <= 2 && i + k < cells.length; k++) {
+        const nxt = String(cells[i + k] == null ? "" : cells[i + k]);
+        if (bandOfLabel(nxt)) break;
+        const p = parseMoney(nxt);
+        if (p != null) { v = p; break; }
+        if (/not\s*specified|n\/?a\b/i.test(nxt)) break;
+      }
+    }
+    seen[band] = v;
+  }
+  const rates = {};
+  let found = 0;
+  for (const b in seen) if (seen[b] != null) { rates[b] = seen[b]; found++; }
+
+  const joined = cells.join("\n");
+  const pc = joined.match(/Rate\s*Card\s*#(\d+)/i);
+  const cur = joined.match(/\b(AUD|USD|GBP|EUR|NZD|SGD|INR)\b/);
+  return {
+    rates, found,
+    labelsSeen: Object.keys(seen).length,
+    declaredCardId: pc ? Number(pc[1]) : null,
+    currency: cur ? cur[1] : null,
+  };
+}
+
+function textToCells(text) {
+  const cells = [];
+  const lines = String(text).split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    cells.push(line);
+    const parts = line.split(/\s*[,;\t|]\s*/);
+    if (parts.length > 1) for (const p of parts) if (p.trim()) cells.push(p.trim());
+  }
+  return cells;
+}
+
+/* Reads the agreement's supporting document and returns the rates it states.
+   Cached per rate card so one sweep downloads each document at most once. */
+async function rateCardDocRates(card, cache) {
+  const key = String(card.id);
+  if (cache[key]) return cache[key];
+  let res;
+  const fail = (reason) => { cache[key] = { ok: false, reason }; return cache[key]; };
+
+  try {
+    res = await cmms("download-a-file-field", {
+      module_name: "custom_ratecard", record_id: card.id, field_name: RATE_DOC_FIELD,
+    });
+  } catch (e) {
+    return fail("download failed: " + String(e.message || e).slice(0, 90));
+  }
+  const ct = String((res && res.content_type) || "").toLowerCase();
+  const b64 = res && res.file_base64;
+  if (!b64) return fail("no file content returned");
+  // A missing file comes back as a JSON error envelope wearing a file's clothes.
+  if (ct.indexOf("application/json") >= 0) return fail("no document on the field");
+
+  const bytes = b64ToBytes(b64);
+  let cells = null, via = null;
+  if (ct.indexOf("pdf") >= 0 || (bytes.length > 4 && latin1(bytes.subarray(0, 5)) === "%PDF-")) {
+    const ex = pdfTextTokens(bytes);
+    if (!ex.tokens.length) {
+      return fail(`PDF has no extractable text layer (${ex.streams} stream(s), ${ex.decoded} decoded) — likely a scan, which needs OCR`);
+    }
+    cells = ex.tokens;
+    via = "pdf-text-layer";
+    // Matched precisely: an XLSX reports itself as ...openxmlformats..., which a
+    // bare "xml" substring test would wrongly accept as readable text.
+  } else if (/^text\//.test(ct) || /\/(csv|tsv|json|xml|plain)\b/.test(ct) || /\+(json|xml)\b/.test(ct)) {
+    const txt = bytesToText(bytes);
+    if (!txt.trim()) return fail("document decoded to empty text");
+    cells = textToCells(txt);
+    via = "text";
+  } else {
+    // XLSX and images are zip/binary containers this sandbox cannot open.
+    return fail(`unsupported document type '${ct || "unknown"}' — only PDF text layers and text/CSV can be read in-sandbox`);
+  }
+
+  const parsed = parseRateCardCells(cells);
+  parsed.ok = true;
+  parsed.via = via;
+  parsed.contentType = ct;
+  cache[key] = parsed;
+  return parsed;
+}
+
+/* Chooses the baseline for one agreement: the supporting document when it is
+   readable, self-consistent and priced; the structured columns otherwise.
+   A document that names a DIFFERENT agreement is rejected outright — in this org
+   the uploaded files are cross-attached, and trusting them would benchmark a
+   quote against another vendor's rates. */
+async function resolveCardRates(card, cache) {
+  const structured = card.rates || {};
+  const nStruct = Object.keys(structured).length;
+  const fallback = (why) => ({
+    rates: structured, source: "columns", confidence: "native",
+    sourceLabel: "agreement rate columns",
+    note: `Baseline read from the agreement's rate columns (${nStruct} band(s)). ${why}`,
+  });
+
+  if (!card.hasDoc) return fallback("No supporting document is attached to this agreement.");
+
+  const doc = await rateCardDocRates(card, cache);
+  if (!doc.ok) return fallback(`Supporting document could not be used: ${doc.reason}.`);
+
+  if (doc.declaredCardId != null && doc.declaredCardId !== card.id) {
+    return fallback(
+      `Supporting document "${card.docName || "attached file"}" was REJECTED: it states it was generated for ` +
+      `Rate Card #${doc.declaredCardId}, not this agreement (#${card.id}), so it describes a different vendor/site. ` +
+      `This is a data problem on the agreement record, not a parsing failure.`
+    );
+  }
+  if (!doc.found) {
+    return fallback(
+      `Supporting document "${card.docName || "attached file"}" was read (${doc.labelsSeen} rate row(s) found) but states no ` +
+      `numeric rate — every band reads as not specified.`
+    );
+  }
+
+  const provenance = doc.declaredCardId != null
+    ? `Its provenance line names Rate Card #${doc.declaredCardId}, matching this agreement.`
+    : `It carries no provenance line, so the match to this agreement rests on the file being attached to it.`;
+  const diffs = [];
+  for (const b in doc.rates) {
+    if (structured[b] != null && structured[b] !== doc.rates[b]) {
+      diffs.push(`${BAND_LABEL[b] || b} ${structured[b]}→${doc.rates[b]}`);
+    }
+  }
+  return {
+    rates: doc.rates, source: "document", confidence: "derived",
+    sourceLabel: `supporting document (${card.docName || "attached file"})`,
+    note:
+      `Baseline read from the agreement's SUPPORTING DOCUMENT "${card.docName || "attached file"}" ` +
+      `via its ${doc.via === "text" ? "text content" : "PDF text layer"} — ${doc.found} rate(s) parsed` +
+      `${doc.currency ? " in " + doc.currency : ""}. ${provenance} ` +
+      `Label-to-rate matching is heuristic, so this baseline is marked derived rather than native.` +
+      (diffs.length ? ` It DISAGREES with the rate columns on: ${diffs.join(", ")}.` : nStruct ? " It agrees with the rate columns." : ""),
+    disagreements: diffs,
+  };
+}
+
 async function loadRateCards() {
-  const select = ["id", "name", "moduleState", "siteId", "vendor_custom_ratecard", "contract_custom_ratecard"]
+  const select = ["id", "name", "moduleState", "siteId", "vendor_custom_ratecard", "contract_custom_ratecard", RATE_DOC_FIELD]
     .concat(Object.keys(RATE_FIELDS).map((k) => RATE_FIELDS[k])).join(",");
   const rows = await listCustom("custom_ratecard", { select, page_size: 200 }, 2);
   const index = {};
-  let priced = 0, unpriced = 0;
+  let priced = 0, unpriced = 0, withDoc = 0, docOnly = 0;
   for (const r of rows) {
     const rates = {};
     let has = false;
@@ -777,16 +1224,32 @@ async function loadRateCards() {
       const v = num(r[RATE_FIELDS[band]]);
       if (v != null) { rates[band] = v; has = true; }
     }
-    // A rate card row with every rate null is not a zero-priced card — skip it.
-    if (!has) { unpriced++; continue; }
-    priced++;
+    const docMeta = r[RATE_DOC_FIELD];
+    const hasDoc = !!(docMeta && docMeta.fileId);
+    if (hasDoc) withDoc++;
+    // A card with no rate columns is not a zero-priced card. It is still worth
+    // keeping when a supporting document might supply the rates instead.
+    if (!has) {
+      unpriced++;
+      if (!hasDoc) continue;
+      docOnly++;
+    } else {
+      priced++;
+    }
     const vId = idOf(r.vendor_custom_ratecard), sId = idOf(r.siteId);
     if (vId == null || sId == null) continue;
-    index[vId + ":" + sId] = {
+    const slot = vId + ":" + sId;
+    // Several agreements can share a vendor+site. The long-standing behaviour is
+    // "last priced card wins"; a card that only has a document must not displace
+    // one that carries real rate columns.
+    const prior = index[slot];
+    if (prior && !has && Object.keys(prior.rates).length) continue;
+    index[slot] = {
       id: r.id, name: r.name, rates, contractId: idOf(r.contract_custom_ratecard),
+      hasDoc, docName: hasDoc ? docMeta.fileName : null, docType: hasDoc ? docMeta.fileContentType : null,
     };
   }
-  return { index, priced, unpriced, scanned: rows.length };
+  return { index, priced, unpriced, withDoc, docOnly, scanned: rows.length };
 }
 
 // Contract validity gate. Dates are frequently unset in this org, so an absent
@@ -813,10 +1276,10 @@ async function contractStatus(contractId, cache) {
 
 async function quotingEvidence(d) {
   const cards = await loadRateCards();
-  if (!cards.priced) {
+  if (!cards.priced && !cards.docOnly) {
     return {
       items: [],
-      note: `Scanned ${cards.scanned} rate cards; none carry any rate value, so no quote could be compared.`,
+      note: `Scanned ${cards.scanned} rate cards; none carry a rate value or a readable supporting document, so no quote could be compared.`,
     };
   }
 
@@ -881,17 +1344,28 @@ async function quotingEvidence(d) {
   }
 
   const contractCache = {};
+  const docCache = {};
+  const baselineCache = {};
   const items = [];
   let quotesChecked = 0, linesChecked = 0;
+  const sourceTally = { document: 0, columns: 0 };
   for (const c of candidates) {
     const contract = await contractStatus(c.card.contractId, contractCache);
+    // Where this agreement's baseline comes from — the uploaded rate card when it
+    // is usable, otherwise the structured columns. Resolved once per agreement.
+    let baseline = baselineCache[c.card.id];
+    if (!baseline) {
+      baseline = await resolveCardRates(c.card, docCache);
+      baselineCache[c.card.id] = baseline;
+    }
+    const cardRates = baseline.rates || {};
     quotesChecked++;
     const over = [];
     let checked = 0, quotedTotal = 0, expectedTotal = 0;
     const skipped = [];
     for (const li of c.lines) {
       const b = bands[String(li.id)] || {};
-      const rate = b.band && c.card.rates[b.band] != null ? c.card.rates[b.band] : null;
+      const rate = b.band && cardRates[b.band] != null ? cardRates[b.band] : null;
       if (rate == null) { skipped.push({ id: li.id, band: b.band || "unknown", why: b.band === "not_labour" ? "not priced by the rate card" : "no rate for band" }); continue; }
       checked++;
       const unit = num(li.unitPrice), qty = num(li.quantity) || 1;
@@ -906,6 +1380,7 @@ async function quotingEvidence(d) {
     }
     linesChecked += checked;
     if (!over.length) continue;
+    sourceTally[baseline.source] = (sourceTally[baseline.source] || 0) + 1;
 
     const variance = round2(quotedTotal - expectedTotal);
     const pct = expectedTotal > 0 ? round2((variance / expectedTotal) * 100) : null;
@@ -918,7 +1393,7 @@ async function quotingEvidence(d) {
       ref: "QT-" + (c.quote.localId || c.quote.id),
       title: `${nameOf(c.quote.vendor) || "Vendor"} quoted ${pct != null ? pct + "% " : ""}above the contracted rate card`,
       meta: [c.quote.subject, nameOf(c.quote.siteId), `Quoted ${money(quotedTotal)} vs rate card ${money(expectedTotal)}`,
-        `Rate card ${c.card.name}`].filter(Boolean).join(" · "),
+        `Rate card ${c.card.name}`, `Baseline from ${baseline.sourceLabel}`].filter(Boolean).join(" · "),
       signal_type: "abnormal_quote",
       vendor: nameOf(c.quote.vendor), vendor_id: c.vendorId, site: nameOf(c.quote.siteId),
       metric_name: "Quoted vs contracted rate", metric_unit: "currency",
@@ -926,9 +1401,13 @@ async function quotingEvidence(d) {
       variance_value: variance, variance_pct: pct,
       occurrence_count: over.length, sample_size: checked,
       period_label: "Current quote", record_url: recUrl("quote", c.quote.id),
-      data_confidence: "native",
+      // A document-derived baseline rests on a heuristic label-to-rate match, so
+      // it is never claimed as native.
+      data_confidence: baseline.confidence,
+      baseline_source: baseline.sourceLabel,
       dataConfidenceNote:
-        `Both sides are read from real records: quote line unitPrice and rate card ${c.card.name} (id ${c.card.id}). ` +
+        `Baseline source: ${baseline.sourceLabel}. ${baseline.note} ` +
+        `Quote line unitPrice is read from the real quote record; the agreement is ${c.card.name} (id ${c.card.id}). ` +
         `Worst line: ${worst.bandLabel} quoted ${worst.unitPrice} against a contracted ${worst.rate}. ` +
         `The rate BAND for each line was inferred from the line's own text (${inferred} of ${over.length} by the classifier agent), ` +
         `because line items carry no structured day/rate discriminator. ` +
@@ -938,10 +1417,18 @@ async function quotingEvidence(d) {
       overLines: over,
     });
   }
+  const rejected = [];
+  for (const k in baselineCache) {
+    const b = baselineCache[k];
+    if (b.source === "columns" && /REJECTED/.test(b.note)) rejected.push(k);
+  }
   return {
     items,
     note: `${quotes.length} quotes, ${quotesChecked} with a rate card, ${linesChecked} lines compared, ${items.length} over rate. ` +
-      `Rate cards: ${cards.priced} priced of ${cards.scanned} scanned (${cards.unpriced} have no rates). Band classifier: ${classifier}.`,
+      `Rate cards: ${cards.priced} priced of ${cards.scanned} scanned (${cards.unpriced} have no rates, ${cards.withDoc} carry a supporting document). ` +
+      `Baselines used: ${sourceTally.document} from the supporting document, ${sourceTally.columns} from the rate columns` +
+      (rejected.length ? `; ${rejected.length} document(s) rejected for naming a different agreement` : "") +
+      `. Band classifier: ${classifier}.`,
   };
 }
 
@@ -1197,6 +1684,34 @@ async function invoicingEvidence(d, opts) {
    Targets come from the org's real SLA policy, not a hardcoded number.
    Breaches are grouped per vendor and a repeat-history flag is computed. */
 
+/* PRODUCT RULE: a vendor becomes an SLA signal only once it has breached at
+   least this many times. One or two late work orders is noise, not a pattern
+   worth putting in front of an FM. A vendor below the threshold produces
+   NOTHING — not a low-severity card, not a muted row. Single named constant so
+   the rule can be retuned in one place. */
+const SLA_MIN_BREACHES_PER_VENDOR = 4;
+
+/* Pure: breach rows -> vendors split by the threshold. No I/O and no clock, so
+   it can be exercised against real payloads under plain node without deploying.
+   `belowThreshold` is returned rather than discarded so the run note can state
+   honestly how much was suppressed. */
+function groupBreachesByVendor(breaches, minBreaches) {
+  const min = minBreaches == null ? SLA_MIN_BREACHES_PER_VENDOR : minBreaches;
+  const byVendor = {};
+  for (const b of breaches || []) {
+    if (!byVendor[b.vendorId]) byVendor[b.vendorId] = { vendorId: b.vendorId, name: b.vendorName, list: [] };
+    byVendor[b.vendorId].list.push(b);
+  }
+  const qualifying = [], belowThreshold = [];
+  for (const vId of Object.keys(byVendor)) {
+    const g = byVendor[vId];
+    (g.list.length >= min ? qualifying : belowThreshold).push(g);
+  }
+  // Loudest first, so a truncated read still shows the worst offender.
+  qualifying.sort((a, b) => b.list.length - a.list.length);
+  return { qualifying, belowThreshold, min };
+}
+
 async function loadSlaConfig() {
   const pols = await callAction("facilio-process-automation", "list-sla-policies", { moduleName: "workorder" });
   const active = ((pols && pols.items) || []).filter((p) => p.active !== false && p.status !== false);
@@ -1309,15 +1824,13 @@ async function slaEvidence(d) {
     });
   }
 
-  const byVendor = {};
-  for (const b of breaches) {
-    if (!byVendor[b.vendorId]) byVendor[b.vendorId] = { name: b.vendorName, list: [] };
-    byVendor[b.vendorId].list.push(b);
-  }
+  // Vendors under SLA_MIN_BREACHES_PER_VENDOR are dropped here and never reach
+  // the item list, so they cannot surface as a quiet low-severity row either.
+  const { qualifying, belowThreshold, min: minBreaches } = groupBreachesByVendor(breaches);
 
   const items = [];
-  for (const vId of Object.keys(byVendor)) {
-    const g = byVendor[vId];
+  for (const g of qualifying) {
+    const vId = g.vendorId;
     const list = g.list;
     const days = {};
     for (const b of list) days[String(b.created || "").slice(0, 10)] = true;
@@ -1365,7 +1878,8 @@ async function slaEvidence(d) {
         (insufficient
           ? `INSUFFICIENT HISTORY: ${list.length} breach(es) over a sample of ${sample} across ${distinctDays} day(s). A breach rate over time cannot be established from this — do not read it as a trend. `
           : `${list.length} breaches across ${distinctDays} distinct days indicates a repeat pattern. `) +
-        `Vendor attribution is via workorder.vendor; service requests carry no vendor field and have no SLA policy, so they are excluded.`,
+        `Vendor attribution is via workorder.vendor; service requests carry no vendor field and have no SLA policy, so they are excluded. ` +
+        `Raised because this vendor breached ${list.length} time(s), meeting the product rule of at least ${minBreaches} breaches by the same vendor; vendors under that count are not reported at all.`,
       insufficient_history: insufficient,
       repeat_offender: repeat,
       breaches: list.slice(0, 10),
@@ -1376,7 +1890,13 @@ async function slaEvidence(d) {
     items,
     note: `Policy "${cfg.policyName}" (${cfg.policyId}). ${wos.length} work orders scanned, ${breaches.length} breaching with a vendor, ` +
       `${noVendorBreaches} breaching without a vendor (excluded), ${pausedBreaches} on a paused SLA clock, ` +
-      `${noPolicyMatch} with no priority commitment in the policy. ${items.length} vendor signal(s).`,
+      `${noPolicyMatch} with no priority commitment in the policy. ` +
+      `${qualifying.length + belowThreshold.length} vendor(s) breached at least once; ` +
+      `${belowThreshold.length} suppressed for breaching fewer than ${minBreaches} time(s)` +
+      (belowThreshold.length
+        ? ` (${belowThreshold.map((g) => `${g.name} ${g.list.length}`).join(", ")})`
+        : "") +
+      `. ${items.length} vendor signal(s).`,
   };
 }
 
@@ -1511,6 +2031,8 @@ async function doSignals(args) {
           overLines: e.overLines, lineFindings: e.lineFindings, fsr: e.fsr,
           breaches: e.breaches, insufficient_history: e.insufficient_history,
           repeat_offender: e.repeat_offender,
+          // Where a quoting baseline came from, so the comparison stays auditable.
+          baseline_source: e.baseline_source,
         },
       };
       upsertSignal(d, row, now, flowRunId) === "inserted" ? inserted++ : updated++;
