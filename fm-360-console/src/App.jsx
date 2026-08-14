@@ -379,6 +379,7 @@ export default function App() {
         if (res?.ok) {
           setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}` });
           flash(`${job.ref} — ${res.permit_status}`); await refreshCounts(); await loadPage(bucket, page);
+          if (!bucket) await refreshImportant({ quiet: true });
         } else {
           setResult({ id: job.external_id, status: "err", text: res?.error || "Could not complete that." });
           flash(`Couldn't ${action.label.toLowerCase()}: ${res?.error || "error"}`); await loadPage(bucket, page);
@@ -403,6 +404,7 @@ export default function App() {
         flash(`${action.label} · ${job.ref} — synced to Facilio`);
         await refreshCounts();
         await loadPage(bucket, page);
+        if (!bucket) await refreshImportant({ quiet: true });
       } else {
         setResult({ id: job.external_id, status: "err", text: res?.error || "unknown error" });
         flash(`Couldn't sync to Facilio: ${res?.error || "unknown error"}`);
@@ -491,6 +493,7 @@ export default function App() {
         setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
         setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
         await refreshCounts(); await loadPage(bucket, page);
+        if (!bucket) await refreshImportant({ quiet: true });
       } else {
         flash("Couldn't create quote: " + (res?.error || "unknown error"));
       }
@@ -680,8 +683,9 @@ export default function App() {
             {showLanding ? (
               <ImportantNow
                 items={important} busy={importantBusy} error={importantError} at={importantAt}
-                selectedId={selected?.external_id}
+                selectedId={selected?.external_id} actingId={actingId}
                 onPick={pick} onOpenQueue={selectBucket} onRetry={() => refreshImportant()}
+                onAction={(it, a) => takeAction(it, a)}
               />
             ) : (
               <>
@@ -935,7 +939,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
 
         {job.ai_note && (
           <div className="ai">
-            <div className="ai__label">✦ AI summary</div>
+            <div className="ai__label"><Icon name="spark" /> AI summary</div>
             {job.ai_note}
           </div>
         )}
@@ -1052,7 +1056,7 @@ function renderMd(text) {
 /* ==========================================================================
    Important now — the landing view. Ranked across every action queue.
    ========================================================================== */
-function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue, onRetry }) {
+function ImportantNow({ items, busy, error, at, selectedId, actingId, onPick, onOpenQueue, onRetry, onAction }) {
   const loading = items === null;
   const list = items || [];
   // Ranking three connection reads is the console's longest routine wait, so this
@@ -1131,7 +1135,9 @@ function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue,
           <ImportantRow
             key={it.external_id} it={it} rank={i + 1}
             selected={selectedId === it.external_id}
+            acting={actingId === it.external_id}
             onPick={() => onPick(it)} onOpenQueue={() => onOpenQueue(it.bucket)}
+            onAction={(a) => onAction(it, a)}
           />
         ))}
       </div>
@@ -1169,11 +1175,47 @@ function guessTone(reason) {
   return "red"; // everything left is a hazard label (Fire risk, Leak, Electrical, …)
 }
 
-function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
+/**
+ * The record's own next step, derived for the ranked list.
+ *
+ * triage.js is self-contained and does not compose `actions`, so these mirror
+ * feed.js's tsr/unblock verbs exactly — same labels, same act, same intent, so a
+ * click here runs the identical flow as a click in the queue. Kept in step with
+ * feed.js by hand, which is the same contract triage already has with it.
+ *
+ * Returns [] when the state is not one this can be sure about, so the row falls
+ * back to "Open queue" rather than offering a verb that might be wrong.
+ */
+function importantActions(it) {
+  if (it.bucket === "unblock") {
+    // Permits reach the ranked list only from moduleState=awaitingfmapproval.
+    return [
+      { label: "Review permit", kind: "primary", act: "agent", intent: "review_permit",
+        prompt: "Review this work permit and recommend whether it can be approved." },
+    ];
+  }
+  if (it.bucket === "tsr") {
+    const state = String(it.state || "");
+    if (state === "Open") {
+      return [{ label: "Acknowledge & proceed", kind: "primary", act: "agent", intent: "tsr_flow",
+        prompt: "Acknowledge this tenant service request, then raise the work order for it." }];
+    }
+    if (state === "tsrvalidated") {
+      return it.quote_path === "Provide In-House CBRE Quote"
+        ? [{ label: "Create Tenant Quote", kind: "primary", act: "quote" }]
+        : [{ label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order",
+            prompt: "Raise the work order for this request." }];
+    }
+  }
+  return [];
+}
+
+function ImportantRow({ it, rank, selected, acting, onPick, onOpenQueue, onAction }) {
   const chips = (it.why || []).map((w, j) => ({ text: w, tone: (it.why_tones || [])[j] || guessTone(w) }));
   const worst = worstTone(chips.map((c) => c.tone).concat(it.tone ? [it.tone] : []));
   const sev = TONE_SEV[worst] || "info";
   const caption = [it.site, it.tenant].filter(Boolean).join(" · ");
+  const acts = importantActions(it);
   return (
     <div
       id={"row-" + it.external_id}
@@ -1199,12 +1241,26 @@ function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
               <span style={{ width: 7, height: 7, borderRadius: 7, background: SEV_VAR[sev], display: "inline-block" }} />
               <em>{it.bucket_label || it.bucket}</em>
             </span>
-            {caption && <span>⌂ <em title={caption}>{caption}</em></span>}
+            {caption && <span><Icon name="site" /><em title={caption}>{caption}</em></span>}
           </div>
+          {/* Act on it here. Sending the FM into the queue to press the same button
+              made the ranked list a signpost instead of a place of work. */}
           <div className="card__actions">
-            <button className="btn btn--sm" onClick={(e) => { e.stopPropagation(); onOpenQueue(); }}>Open queue →</button>
+            {acts.map((a, i) => (
+              <button
+                key={i}
+                className={"btn" + (a.kind === "primary" ? " btn--primary" : "")}
+                disabled={acting}
+                onClick={(e) => { e.stopPropagation(); onAction(a); }}
+              >
+                {acting && a.kind === "primary" ? "Working…" : a.label}
+              </button>
+            ))}
+            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onOpenQueue(); }}>
+              Open queue
+            </button>
             {it.record_url && (
-              <button className="btn btn--sm btn--ghost" onClick={(e) => { e.stopPropagation(); window.open(it.record_url, "_blank", "noopener"); }}>
+              <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); window.open(it.record_url, "_blank", "noopener"); }}>
                 View in Facilio
               </button>
             )}
@@ -1222,10 +1278,12 @@ function Card({ r, selected, acting, onPick, onAction }) {
   const age = ageInfo(r.created_time);
   const sev = r.tone ? sevOf(r.tone, r.priority) : (age.sev || "info");
   const acts = (r.actions || []).filter((a) => a.act !== "open" || r.record_url);
-  const primary = acts.find((a) => a.kind === "primary");
   const chips = [];
-  if (r.flag) chips.push({ text: r.flag, cls: "pill" });
-  if (r.priority && r.priority !== "Normal") chips.push({ text: r.priority, cls: "pill" });
+  if (r.flag) chips.push(r.flag);
+  // flag2 is the record's second fact (e.g. "Chargeable to tenant") — it sits
+  // beside the state pill rather than displacing it.
+  if (r.flag2) chips.push(r.flag2);
+  if (r.priority && r.priority !== "Normal" && r.priority !== "Signal") chips.push(r.priority);
 
   return (
     <div
@@ -1239,36 +1297,49 @@ function Card({ r, selected, acting, onPick, onAction }) {
       <div className="card__row">
         <div className="card__body">
           <div className="card__top">
-            <span className="card__id">{r.ref}</span>
+            <span className="card__id">{r.ref}{r.local_id ? " · #" + r.local_id : ""}</span>
             {age.label && <span className={"pill pill--" + (age.sev || "info")} title={age.exact}><span className="pill__d" />{age.label}</span>}
-            {chips.slice(0, 2).map((c, i) => <span key={i} className={c.cls}>{c.text}</span>)}
-            {chips.length > 2 && <span className="pill">+{chips.length - 2}</span>}
+            {chips.slice(0, 2).map((c, i) => <span key={i} className="pill">{c}</span>)}
+            {chips.length > 2 && <span className="pill" title={chips.slice(2).join(" · ")}>+{chips.length - 2}</span>}
           </div>
           <div className="card__title" title={r.title}>{r.title || "—"}</div>
-          <div className="card__meta">
-            {r.site && <span>⌂ <em title={r.site}>{r.site}</em></span>}
-            {r.tenant && <span>◇ <em title={r.tenant}>{r.tenant}</em></span>}
-            {r.vendor && <span>⚒ <em title={r.vendor}>{r.vendor}</em></span>}
-            {r.created_time && <span className="tnum">◷ <em>{fmtDateTime(r.created_time)}</em></span>}
-          </div>
-          {r.valid_from && (
-            <div className="card__meta tnum" style={{ marginTop: 4 }}>
-              <span>Valid <em>{fmtDateTime(r.valid_from)} → {fmtDateTime(r.valid_to)}</em></span>
+          {/* `meta` is composed per bucket on the server and is the only line that
+              carries the substance for orders and signals (variance amounts, breach
+              counts). The structured site/tenant/vendor breakdown lives in the
+              context panel, where it can be labelled. */}
+          {r.meta && (
+            <div className="card__meta">
+              <span><Icon name="info" /><em title={r.meta}>{r.meta}</em></span>
+            </div>
+          )}
+          {r.created_time && (
+            <div className="card__meta tnum" style={{ marginTop: 3 }}>
+              <span><Icon name="clock" /><em>{fmtDateTime(r.created_time)}</em></span>
+              {r.valid_from && <span><Icon name="calendar" /><em>Valid {fmtDateTime(r.valid_from)} → {fmtDateTime(r.valid_to)}</em></span>}
             </div>
           )}
           {r.ai_note && (
             <div className="ai">
-              <div className="ai__label">✦ AI</div>
+              <div className="ai__label"><Icon name="spark" /> AI</div>
               {r.ai_note}
             </div>
           )}
+          {/* Every action the server offered, inline. Sending the FM to a panel to
+              find the second button turned a one-step job into two. */}
           <div className="card__actions">
-            {primary && (
-              <button className="btn btn--primary" disabled={acting} onClick={(e) => { e.stopPropagation(); onAction(primary); }}>
-                {acting ? "Working…" : primary.label}
+            {acts.map((a, i) => (
+              <button
+                key={i}
+                className={"btn" + (a.kind === "primary" ? " btn--primary" : "")}
+                disabled={acting}
+                onClick={(e) => { e.stopPropagation(); onAction(a); }}
+              >
+                {acting && a.kind === "primary" ? "Working…" : a.label}
               </button>
-            )}
-            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onPick(); }}>Open</button>
+            ))}
+            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onPick(); }}>
+              Details
+            </button>
           </div>
         </div>
       </div>
@@ -1277,6 +1348,33 @@ function Card({ r, selected, acting, onPick, onAction }) {
 }
 
 /* --------------------------------------------------------------- primitives */
+
+/**
+ * Inline SVG icons, replacing the unicode glyphs (⌂ ◇ ⚒ ◷) the metadata rows used.
+ * Those render differently on every platform, sit off the text baseline, and were
+ * the single biggest thing making a considered layout look unfinished. They use
+ * currentColor, so they inherit the row's colour.
+ */
+const ICON_PATHS = {
+  site: "M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z",
+  clock: "M12 7v5l3.5 2M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z",
+  calendar: "M7 4v3m10-3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z",
+  info: "M12 16v-5h-1m1-3h.01M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z",
+  spark: "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z",
+};
+const Icon = ({ name, size = 13 }) => {
+  const d = ICON_PATHS[name];
+  if (!d) return null;
+  return (
+    <svg
+      className="ic" width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"
+      aria-hidden="true" focusable="false"
+    >
+      <path d={d} />
+    </svg>
+  );
+};
 
 const SkeletonList = ({ rows = 5 }) => (
   <div className="cards">

@@ -67,6 +67,9 @@ body {
    so IT scrolls rather than the page. */
 .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+/* Metadata icons sit on the text baseline and inherit the row's colour. */
+.ic { flex: none; opacity: 0.65; margin-top: 1px; }
+
 /* numbers must not jitter as the feed refreshes */
 .tnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
 
@@ -86,7 +89,10 @@ button { font-family: inherit; }
 
 .topbar {
   height: 56px; flex: none; display: flex; align-items: center; gap: 12px;
-  padding: 0 20px; background: var(--surface);
+  padding: 0 20px;
+  /* a hair of depth so the bar reads as a surface above the canvas, without a
+     drop shadow sitting on top of another drop shadow */
+  background: linear-gradient(var(--surface), var(--surface-2));
   border-bottom: 1px solid var(--hairline);
   position: sticky; top: 0; z-index: 20;
 }
@@ -166,11 +172,15 @@ button { font-family: inherit; }
 }
 .qrow__dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--qc, var(--info)); }
 .qrow__label { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* the count is tinted by the queue's own severity, so the rail reads as a shape
+   of workload rather than a list of neutral numbers */
 .qrow__n {
   flex: none; min-width: 22px; text-align: center; font-size: 12px; font-weight: 600;
-  color: var(--ink-2); background: var(--canvas); border-radius: 20px; padding: 1px 7px;
+  color: var(--qc, var(--ink-2)); background: var(--canvas);
+  border-radius: 20px; padding: 1px 7px;
+  font-variant-numeric: tabular-nums;
 }
-.qrow[aria-current="true"] .qrow__n { color: var(--brand-ink); background: var(--surface); }
+.qrow[aria-current="true"] .qrow__n { background: var(--surface); }
 
 .railfoot {
   margin-top: auto; padding: 12px 8px 4px; border-top: 1px solid var(--hairline);
@@ -191,24 +201,35 @@ button { font-family: inherit; }
 .card {
   position: relative; width: 100%; text-align: left; cursor: pointer;
   background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: var(--radius-card); padding: 16px 18px 16px 20px;
-  overflow: hidden; transition: border-color var(--ease), box-shadow var(--ease), background var(--ease);
+  border-radius: var(--radius-card); padding: 18px 20px 18px 22px;
+  overflow: hidden;
+  transition: border-color var(--ease), box-shadow var(--ease), background var(--ease), transform var(--ease);
 }
-.card:hover { box-shadow: var(--shadow-hover); border-color: var(--hairline-strong); }
+/* a small lift on hover, and a real ring when selected — enough to feel
+   responsive without the page bouncing */
+.card:hover {
+  box-shadow: 0 2px 8px rgba(16, 19, 23, 0.07), 0 1px 2px rgba(16, 19, 23, 0.04);
+  border-color: var(--hairline-strong); transform: translateY(-1px);
+}
 .card[aria-selected="true"] {
   border-color: var(--brand-line); background: var(--brand-tint);
-  box-shadow: var(--shadow-hover);
+  box-shadow: 0 0 0 3px var(--brand-tint), 0 2px 10px rgba(91, 69, 224, 0.1);
 }
-.card__bar { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--sev, var(--info)); }
+/* the severity bar fades out down the card instead of a flat stripe */
+.card__bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: linear-gradient(to bottom, var(--sev, var(--info)) 0%, var(--sev, var(--info)) 55%, transparent 100%);
+}
 
 .card__top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .card__id {
-  font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-  color: var(--ink-3);
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
 .card__title {
-  font-size: 15.5px; font-weight: 600; line-height: 1.35; color: var(--ink);
-  margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 16.5px; font-weight: 600; line-height: 1.35; color: var(--ink);
+  letter-spacing: -0.012em;
+  margin-bottom: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .card__meta {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -217,7 +238,10 @@ button { font-family: inherit; }
 /* icon stays pinned to the top-left of its value, so a value that wraps onto a
    second line never orphans the glyph on a line of its own */
 .card__meta span { display: inline-flex; align-items: flex-start; gap: 5px; min-width: 0; flex-wrap: nowrap; }
-.card__meta em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30ch; min-width: 0; }
+/* no 30ch cap: `meta` is the card's main information line for orders and signals,
+   so it gets the full width and ellipsises at the card edge instead */
+.card__meta em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; min-width: 0; }
+.card__meta > span { max-width: 100%; }
 .card__row { display: flex; align-items: flex-start; gap: 16px; }
 .card__body { flex: 1; min-width: 0; }
 .card__side { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
@@ -438,7 +462,10 @@ kbd {
   .card__title { white-space: normal; }
   /* a long tenant or vendor name must wrap, not push the card sideways */
   .card__meta em { max-width: 100%; white-space: normal; }
+  /* real verbs share the row; the ghost "Details" stays its own size rather than
+     stretching across a line of its own */
   .card__actions .btn { flex: 1 1 auto; }
+  .card__actions .btn--ghost { flex: 0 0 auto; }
 
   /* WCAG-comfortable tap targets */
   .btn { min-height: 44px; padding: 10px 16px; }
