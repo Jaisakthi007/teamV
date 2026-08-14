@@ -99,13 +99,18 @@ export default function App() {
     const sub = vibe.subscribe(AGENT_TOPIC, (evt) => {
       const p = (evt && evt.payload) || {};
       if (!p.runId) return;
+      // Interim note from a slow turn: replace the spinner's caption, don't end the turn.
+      if (p.progress) {
+        setAgent((a) => (a && a.runId === p.runId ? { ...a, note: p.progress } : a));
+        return;
+      }
       setAgent((a) => {
         if (!a || a.runId !== p.runId) return a;
         clearTimeout(agentTimer.current);
         const turn = p.ok
           ? { role: "agent", text: p.reply || "(no reply)" }
           : { role: "error", text: p.error || "The team could not complete that." };
-        return { ...a, busy: false, runId: null, threadId: a.threadId || p.threadId || null, turns: [...a.turns, turn] };
+        return { ...a, busy: false, runId: null, note: null, threadId: a.threadId || p.threadId || null, turns: [...a.turns, turn] };
       });
       if (p.ok) refreshCounts();
     });
@@ -175,7 +180,7 @@ export default function App() {
     const runId = newRunId();
     setAgent((a) => {
       const base = a || { job, threadId: null, turns: [] };
-      return { ...base, job: job || base.job, busy: true, runId, turns: [...base.turns, { role: "fm", text: prompt }] };
+      return { ...base, job: job || base.job, busy: true, runId, note: null, turns: [...base.turns, { role: "fm", text: prompt }] };
     });
 
     // A run killed from outside (timeout ceiling, deploy mid-run) can never publish,
@@ -420,8 +425,8 @@ function AgentPanel({ agent, onSend, onClose }) {
         <div ref={scroller} style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
           {turns.map((t, i) => <Turn key={i} turn={t} />)}
           {busy && (
-            <div style={{ alignSelf: "flex-start", background: C.purpleSoft, border: "1px solid #E4DBFF", color: C.purple, borderRadius: 12, padding: "9px 13px", fontSize: 13 }}>
-              Working…
+            <div style={{ alignSelf: "flex-start", background: C.purpleSoft, border: "1px solid #E4DBFF", color: C.purple, borderRadius: 12, padding: "9px 13px", fontSize: 13, maxWidth: "92%", lineHeight: 1.5 }}>
+              {agent.note || "Working…"}
             </div>
           )}
         </div>

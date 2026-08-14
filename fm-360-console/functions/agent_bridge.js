@@ -92,6 +92,56 @@ function recordIdOf(externalId) {
  * off the live record, so the team never has to ask the FM to re-type what is
  * already recorded — and can't drift from the record's real state.
  */
+/** Names out of a picklist/list payload, whatever key the module uses for the label. */
+function optionNames(resp, limit) {
+  const rows = (resp && (resp.items || resp.data)) || envelope(resp).records || [];
+  const names = [];
+  for (const r of rows) {
+    const n = typeof r === "string" ? r : (r && (r.displayName || r.name || r.type || r.priority));
+    if (n) names.push(String(n));
+  }
+  return names.slice(0, limit || 40);
+}
+
+/**
+ * The option lists the Create Work Order agent would otherwise fetch itself.
+ *
+ * Each lookup it makes is another round trip inside the team run, which is what
+ * made the work-order turn take minutes while acknowledge took seconds. Fetching
+ * them here — three cheap parallel reads — lets the team ask the FM immediately.
+ * Never fatal: a missing list just means the agent looks that one up as before.
+ */
+async function workOrderOptions() {
+  const [priority, type, permit] = await Promise.all([
+    tryAct("facilio-customization", "picklist", { moduleName: "workorder", fieldName: "priority" }),
+    tryAct("facilio-customization", "picklist", { moduleName: "workorder", fieldName: "type" }),
+    tryAct("facilio-cmms", "list-work-permit-types", {}),
+  ]);
+  const lines = [];
+  const push = (label, names) => {
+    if (names.length) lines.push(`${label}: ${names.join(", ")}`);
+  };
+  push("Work order priorities", optionNames(priority));
+  push("Work order types", optionNames(type));
+  push("Work permit types", optionNames(permit));
+  if (!lines.length) return "";
+  return [
+    "",
+    "=== OPTIONS AVAILABLE (already looked up — do NOT look these up again) ===",
+    ...lines,
+    "=== END OPTIONS ===",
+  ].join("\n");
+}
+
+/** Non-fatal read: an option list that fails must not sink the whole turn. */
+async function tryAct(connection, action, input) {
+  try {
+    return await callAction(connection, action, input);
+  } catch (e) {
+    return null;
+  }
+}
+
 async function briefingFor(srId) {
   // get-service-request returns the record already expanded; the list action's
   // id= filter does not match, so don't reach for it here.
@@ -184,6 +234,7 @@ async function stateOf(srId) {
 }
 
 async function chatTurn(threadId, team, message, opts) {
+  const progress = (opts && opts.progress) || (async () => {});
   const srId = opts && opts.srId;
   const stateBefore = opts && opts.stateBefore;
 
@@ -213,6 +264,7 @@ async function chatTurn(threadId, team, message, opts) {
       }
     }
 
+    await progress("The team is taking a while — checking whether it received the request…");
     let verdict = null; // "lost" -> resend; anything else is the team's own report
     for (let i = 0; i < 4 && verdict == null; i++) {
       try {
@@ -228,6 +280,7 @@ async function chatTurn(threadId, team, message, opts) {
     if (verdict != null && verdict !== "lost") {
       return { reply: verdict, pending: false, resumed: true };
     }
+    if (verdict === "lost") await progress("The request was dropped in transit — resending it…");
     // verdict === "lost": the message never arrived — loop resends it.
     // verdict == null: every probe aborted too — fall through to pending.
     if (verdict == null) break;
@@ -242,12 +295,12 @@ async function chatTurn(threadId, team, message, opts) {
   };
 }
 
-async function runStart(args) {
+async function runStart(args, progress) {
   const srId = (args && args.sr_id) ? Number(args.sr_id) : recordIdOf(args && args.external_id);
   if (!srId) throw new Error("external_id or sr_id is required");
   const team = (args && args.team) || DEFAULT_TEAM;
 
-  const { sr, briefing } = await briefingFor(srId);
+  const { sr, briefing: record } = await briefingFor(srId);
   const who = args && args.actor ? ` The FM acting is ${args.actor}.` : "";
   // The default openings demand confirmation explicitly: a bare "acknowledge this"
   // or "raise the work order" reads as pre-consent and lets the team write without
@@ -262,7 +315,8 @@ async function runStart(args) {
     create_work_order:
       "The FM wants to raise the WORK ORDER for this ALREADY-ACKNOWLEDGED tenant service request — do not " +
       "re-acknowledge it. Before creating anything, gather the work order inputs from the FM in this chat: the " +
-      "execution path, the work order type and priority (look the valid options up and present them by name), " +
+      "execution path, the work order type and priority (the valid options are listed in the OPTIONS block " +
+      "above — present them by name, do not look them up again), " +
       "whether permits are mandatory (and which permit types if so), and any path-specific details the chosen " +
       "path needs. Present the proposed values and wait for the FM's explicit confirmation in this chat; only " +
       "create the work order after the FM confirms. AFTER it is created, report the work order's id, its " +
@@ -272,6 +326,11 @@ async function runStart(args) {
   const opening = OPENINGS[intent] || OPENINGS.acknowledge;
   const message =
     (args && args.message && String(args.message).trim()) || opening + who;
+
+  // Raising a work order needs picklists the agent would otherwise fetch one at a
+  // time mid-run; acknowledging needs none of them, so only pay for them here.
+  const briefing =
+    intent === "create_work_order" ? record + (await workOrderOptions()) : record;
 
   const thread = await callAction("facilio-ai-studio", "create-chat-thread", {
     agent: team,
@@ -286,12 +345,13 @@ async function runStart(args) {
   const turn = await chatTurn(threadId, team, `${briefing}\n\n${message}`, {
     srId,
     stateBefore: nameOf(sr.moduleState) || String(sr.moduleState ?? ""),
+    progress,
   });
 
   return { ok: true, srId, team, threadId, ...turn, sentAt: nowIso() };
 }
 
-async function runSend(args) {
+async function runSend(args, progress) {
   const threadId = Number(args && args.thread_id);
   if (!threadId) throw new Error("thread_id is required");
   const message = String((args && args.message) || "").trim();
@@ -303,7 +363,7 @@ async function runSend(args) {
   const srId = (args && args.sr_id) ? Number(args.sr_id) : null;
   const stateBefore = srId ? await stateOf(srId) : null;
 
-  const turn = await chatTurn(threadId, team, message, { srId, stateBefore });
+  const turn = await chatTurn(threadId, team, message, { srId, stateBefore, progress });
   return { ok: true, threadId, team, ...turn, sentAt: nowIso() };
 }
 
@@ -317,9 +377,15 @@ async function runSend(args) {
  */
 async function publishResult(kind, args, work) {
   const runId = String((args && args.run_id) || "");
+  // A dropped turn costs a gateway timeout plus a resend, so the panel can sit on
+  // a silent spinner for over a minute. Publish interim notes so the wait is legible.
+  const progress = async (note) => {
+    if (!runId) return;
+    await events.publish(TOPIC, { runId, kind, progress: note });
+  };
   let payload;
   try {
-    payload = { ...(await work()), runId, kind };
+    payload = { ...(await work(progress)), runId, kind };
   } catch (e) {
     payload = { ok: false, runId, kind, error: String((e && e.message) || e).slice(0, 500) };
   }
@@ -366,7 +432,7 @@ server.addHandler({
   description:
     "What the console calls: open the Service Request Operations thread for a service request and publish the team's first reply to the 'srops' topic, tagged with run_id. Started with executeFunctionAsync so a long team run can't time the browser out.",
   parameters: { ...START_PARAMS, run_id: { description: "The panel's correlation id, echoed back on the event", type: "string" } },
-  execute: (args) => publishResult("start", args, () => runStart(args)),
+  execute: (args) => publishResult("start", args, (progress) => runStart(args, progress)),
 });
 
 server.addHandler({
@@ -374,7 +440,7 @@ server.addHandler({
   description:
     "What the console calls for follow-up prompts: run the prompt in the existing thread and publish the team's reply to the 'srops' topic, tagged with run_id.",
   parameters: { ...SEND_PARAMS, run_id: { description: "The panel's correlation id, echoed back on the event", type: "string" } },
-  execute: (args) => publishResult("send", args, () => runSend(args)),
+  execute: (args) => publishResult("send", args, (progress) => runSend(args, progress)),
 });
 
 server.execute();
