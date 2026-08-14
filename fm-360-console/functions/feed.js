@@ -9,7 +9,7 @@ function cfg(key) {
       if (process.env && process.env[key] != null) return process.env[key];
       if (process.system && process.system[key] != null) return process.system[key];
     }
-  } catch (e) {}
+  } catch {}
   return undefined;
 }
 function db() {
@@ -36,7 +36,7 @@ function envelope(j) {
   if (!out.records.length && Array.isArray(j)) out.records = j;
   // nested count locations
   if (out.count == null) {
-    const co = [j.count, j.output && j.output.count, j.pagination && j.pagination.totalCount, j.data && j.data.count];
+    const co = [j.output && j.output.count, j.pagination && j.pagination.totalCount, j.data && j.data.count];
     for (const c of co) if (typeof c === "number") { out.count = c; break; }
   }
   return out;
@@ -109,10 +109,11 @@ const BUCKET_LABELS = {
   // One queue, both states. Named for the RECORD rather than for a step in the
   // flow ("...to acknowledge" would be a lie about half the rows in it now).
   tsr: "Tenant service requests", unblock: "Unblock vendors",
-  referral: "Orders awaiting referral", completion: "Orders awaiting completion",
-  findings: "Open findings", stalled: "Stalled work orders", quotes: "Vendor comments",
-  spot: "Spot checks", tenant: "Tenant dissatisfaction", sla: "SLA breaches by vendor",
+  referral: "Orders awaiting referral",
+  findings: "Open findings", stalled: "Stalled work orders",
+  spot: "Spot checks", sla: "SLA breaches by vendor",
   quoting: "Abnormal quoting", invoicing: "Invoice vs field report",
+  // completion / quotes / tenant live in sweep_jobs' stored-jobs pipeline, not here.
 };
 
 // ============================================================================
@@ -159,19 +160,11 @@ const PO_SELECT = "id,name,description,moduleState,localId,vendor,subTotal,total
 // `custom_polineitemssplit` ("Line Items Building Split"), field
 // `facilio_status_custom_polineitemssplit` — display name literally "Facilio
 // Status" — whose "Referred" option is enum id 4. That module also carries BOTH
-// numbers we need side by side, so when split rows exist no invoice cross-join
-// is needed at all. It currently holds 0 records, so the built-in lineItems
-// path below is what actually runs today.
-const SPLIT_MODULE = "custom_polineitemssplit";
-const SPLIT_STATUS_FIELD = "facilio_status_custom_polineitemssplit";
-const SPLIT_REFERRED = "Referred";                              // enum id 4
-const SPLIT_PO_FIELD = "purchase_order_custom_polineitemssplit"; // LOOKUP -> purchaseorder
-const SPLIT_UNIT_COST = "unit_cost_custom_polineitemssplit";     // the PO line's own unit cost
-const SPLIT_MRI_UNIT_COST = "mri_unit_cost_custom_polineitemssplit"; // the invoice/MRI unit cost
-const SPLIT_LINE_NO = "linenumber";
-const SPLIT_SELECT = "id,name," + SPLIT_LINE_NO + "," + SPLIT_STATUS_FIELD + "," + SPLIT_PO_FIELD +
-  "," + SPLIT_UNIT_COST + "," + SPLIT_MRI_UNIT_COST + ",quantity_custom_polineitemssplit," +
-  "mri_line_status_custom_polineitemssplit,po_line_number_custom_polineitemssplit";
+// numbers we need side by side (`unit_cost_custom_polineitemssplit` next to
+// `mri_unit_cost_custom_polineitemssplit`, keyed back to the PO via
+// `purchase_order_custom_polineitemssplit` and `linenumber`), so when split rows
+// exist no invoice cross-join is needed at all. It currently holds 0 records, so
+// the built-in lineItems path below is what actually runs today.
 
 // The PO line's number. `purchaseorderlineitems` has no line-number field at
 // all; `referenceId` (STRING) is the only line-level identifier, and it is null
@@ -195,7 +188,6 @@ const PO_LINE_NUMBER_FIELDS = ["referenceId"];
 // so referenceId is tier 1 and that description parse is tier 2. Nothing else is
 // used: an unmatched line stays unmatched rather than being guessed by position.
 const INVOICE_LINE_PO_LINE_FIELD = "referenceId";
-const INVOICE_SELECT = "id,localId,invoiceNumber,subject,purchaseOrder,ponumber,mriinvoicekey,totalCost,invoiceStatus";
 // ============================================================================
 
 // ============================================================================
@@ -213,7 +205,7 @@ function findingField(r, kind) {
   for (const f of (map[kind] || [])) if (r[f] != null && r[f] !== "") return nameOf(r[f]);
   return "";
 }
-function findingTone(priority) {
+function priorityTone(priority) {
   const p = String(priority || "").toLowerCase();
   if (p.indexOf("critical") >= 0 || p.indexOf("high") >= 0) return "#B61919";
   if (p.indexOf("medium") >= 0 || p.indexOf("moderate") >= 0) return "#FFD405";
@@ -646,7 +638,7 @@ function permitShapeKey(c) {
 
 const NOTE_STOPWORDS = new Set(["a", "an", "the", "is", "are", "was", "were", "be", "been", "has",
   "have", "had", "and", "or", "of", "to", "in", "on", "at", "for", "with", "all", "any", "this",
-  "that", "it", "its", "as", "by", "from", "not", "no", "if", "will", "been", "completed", "done"]);
+  "that", "it", "its", "as", "by", "from", "not", "no", "if", "will", "completed", "done"]);
 function words(s) {
   return String(s || "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w && !NOTE_STOPWORDS.has(w));
 }
@@ -1100,27 +1092,10 @@ const BUCKETS = {
       const meta = [location || null, tenant ? "Tenant: " + tenant : null, qp ? "Quote path: " + qp : null].filter(Boolean).join(" · ");
       const url = recordUrl("serviceRequest", id);
 
-      // The button is the record's own next step, so a merged queue never asks the
-      // FM to work out which half of the flow a row is in:
-      //   • not yet acknowledged → the whole flow in one conversation. The
-      //     `tsr_flow` intent acknowledges (on the FM's explicit confirmation) and
-      //     then carries straight on to the work order in the SAME chat, instead of
-      //     ending the turn and making the FM come back for the second button.
-      //   • acknowledged, in-house CBRE quote → the local amount dialog, exactly as
-      //     before. This one deliberately does NOT go to the agent.
-      //   • acknowledged, any other quote path → the work order alone.
-      let actions = [];
-      if (!acknowledged) {
-        actions.push({
-          label: "Acknowledge & proceed", kind: "primary", act: "agent", intent: "tsr_flow",
-          prompt: "Acknowledge this tenant service request, then raise the work order for it.",
-        });
-      } else if (qp === "Provide In-House CBRE Quote") {
-        actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
-      } else {
-        actions.push({ label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order", prompt: "Raise the work order for this request." });
-      }
-      actions = withView(actions, url);
+      // The primary button is the record's own next step, produced by
+      // tsrNextStep in enrichPage — which the bucket handler always runs on the
+      // rows it returns, so no row is ever shown without it. Only View lives here.
+      const actions = withView([], url);
 
       return {
         external_id: "tsr:servicerequest:" + id, ref: "TSR-" + (lid || id),
@@ -1174,12 +1149,15 @@ const BUCKETS = {
     // and could invent a step that has not happened.
     async enrichPage(jobs) {
       const rows = jobs || [];
-      // Baseline first: every row gets the suggestion its own state supports, so
-      // a failed read downgrades to an honest line instead of leaving a blank.
+      // Baseline first: every row gets the suggestion (and primary button) its
+      // own state supports, so a failed read downgrades to an honest line
+      // instead of leaving a blank.
       const empty = { srToWo: new Map(), woToPi: new Map(), piToRfq: new Map() };
       for (const row of rows) {
         const step = tsrNextStep(row, empty);
         row.ai_note = step.note;
+        const rest = (row.actions || []).filter((a) => a.kind !== "primary");
+        row.actions = step.action ? [step.action].concat(rest) : rest;
       }
       if (!rows.some((r) => r.acknowledged)) return;
 
@@ -1375,7 +1353,7 @@ const BUCKETS = {
       try {
         recs = envelope(await callAction("facilio-cmms", "list-findings",
           { page_size: 200, sort_by: "sysModifiedTime", sort_order: "desc" })).records;
-      } catch (e) { recs = []; }
+      } catch { recs = []; }
       const created = recs.filter((r) => String(nameOf(r.moduleState) || r.moduleState) === FINDING_CREATED_STATE);
       return created.map((r) => {
         const id = r.id;
@@ -1389,7 +1367,7 @@ const BUCKETS = {
         return {
           external_id: "findings:finding:" + id, ref: "FND-" + (lid || id),
           bucket: "findings", bucket_label: BUCKET_LABELS.findings, source_module: "finding",
-          title: subject, priority: priority || "Normal", tone: findingTone(priority),
+          title: subject, priority: priority || "Normal", tone: priorityTone(priority),
           flag: "", meta, ai_note: "", age_label: "", status: "Created",
           site: location, tenant: "", requested_by: "",
           local_id: lid ? String(lid) : "",
@@ -1421,52 +1399,65 @@ const BUCKETS = {
     // above), which no per-record `filters` expression can express. Open state
     // IS pushed server-side; the PI/PO exclusion is computed here.
     custom: true,
-    async loadRows() {
-      // Open work orders, newest-modified first. No `expand`: expanding lookups
-      // returns whole nested records and blows the payload up ~3x, so site and
-      // vendor names come from small id→name maps instead.
-      const wos = [];
-      for (let page = 1; page <= 3; page++) {
-        const { records } = envelope(await callAction("facilio-cmms", "list-work-orders", {
-          page, page_size: 200,
-          filters: "moduleState=" + WO_OPEN_STATES.join(","),
-          sort_by: "modifiedTime", sort_order: "desc",
-          select: "id,serialNumber,subject,moduleState,priority,siteId,vendor,createdTime,modifiedTime," +
-            "associated_procurement_activity_workorder,purchase_order_workorder,po_id_workorder," +
-            "restrict_work_order_cancellation_workorder",
-        }));
-        wos.push(...records);
-        if (records.length < 200) break;
-      }
-
-      // Every procurement initiation, inverted to the work orders they cover.
-      let piWoIds = new Set();
-      try {
-        piWoIds = procuredWorkOrderIds(envelope(await callAction("facilio-cmms", "list-custom-module-records", {
-          custom_module: "custom_procurementinitiation", page_size: 200,
-          select: "id,moduleState,workorder_custom_procurementinitiation",
-        })).records);
-      } catch { piWoIds = new Set(); }
-
-      // Same inversion for purchase orders. Excludes nothing in this org today
-      // (no PO carries a work-order link) — kept so the bucket is correct the
-      // moment one does. Best-effort: a failed sweep must not empty the bucket.
-      let poWoIds = new Set();
-      try {
-        const pos = [];
-        for (let page = 1; page <= STALLED_PO_SCAN_PAGES; page++) {
-          const { records } = envelope(await callAction("facilio-cmms", "list-purchase-orders", {
-            page, page_size: 200, select: "id,associated_work_order_purchaseorder",
-          }));
-          pos.push(...records);
-          if (records.length < 200) break;
-        }
-        poWoIds = orderedWorkOrderIds(pos);
-      } catch { poWoIds = new Set(); }
+    async loadRows(opts) {
+      // countOnly: the 30s counts poll only needs external_ids (built from the
+      // record id alone), so the display-only site/vendor name maps are skipped.
+      const countOnly = !!(opts && opts.countOnly);
+      // Three mutually independent scans, overlapped. Each keeps its own error
+      // semantics: a failed WO scan still fails the bucket, the PI/PO sweeps
+      // stay best-effort.
+      const [wos, piWoIds, poWoIds] = await Promise.all([
+        // Open work orders, newest-modified first. No `expand`: expanding lookups
+        // returns whole nested records and blows the payload up ~3x, so site and
+        // vendor names come from small id→name maps instead.
+        (async () => {
+          const out = [];
+          for (let page = 1; page <= 3; page++) {
+            const { records } = envelope(await callAction("facilio-cmms", "list-work-orders", {
+              page, page_size: 200,
+              filters: "moduleState=" + WO_OPEN_STATES.join(","),
+              sort_by: "modifiedTime", sort_order: "desc",
+              select: "id,serialNumber,subject,moduleState,priority,siteId,vendor,createdTime,modifiedTime," +
+                "associated_procurement_activity_workorder,purchase_order_workorder,po_id_workorder," +
+                "restrict_work_order_cancellation_workorder",
+            }));
+            out.push(...records);
+            if (records.length < 200) break;
+          }
+          return out;
+        })(),
+        // Every procurement initiation, inverted to the work orders they cover.
+        (async () => {
+          try {
+            return procuredWorkOrderIds(envelope(await callAction("facilio-cmms", "list-custom-module-records", {
+              custom_module: "custom_procurementinitiation", page_size: 200,
+              select: "id,moduleState,workorder_custom_procurementinitiation",
+            })).records);
+          } catch { return new Set(); }
+        })(),
+        // Same inversion for purchase orders. Excludes nothing in this org today
+        // (no PO carries a work-order link) — kept so the bucket is correct the
+        // moment one does. Best-effort: a failed sweep must not empty the bucket.
+        (async () => {
+          try {
+            const pos = [];
+            for (let page = 1; page <= STALLED_PO_SCAN_PAGES; page++) {
+              const { records } = envelope(await callAction("facilio-cmms", "list-purchase-orders", {
+                page, page_size: 200, select: "id,associated_work_order_purchaseorder",
+              }));
+              pos.push(...records);
+              if (records.length < 200) break;
+            }
+            return orderedWorkOrderIds(pos);
+          } catch { return new Set(); }
+        })(),
+      ]);
 
       const stalled = wos.filter((w) => workOrderIsStalled(w, piWoIds, poWoIds));
-      const sites = stalled.length ? await siteMap() : {};
-      const vendors = stalled.some((w) => lookupId(w.vendor)) ? await vendorMap() : {};
+      const [sites, vendors] = await Promise.all([
+        !countOnly && stalled.length ? siteMap() : {},
+        !countOnly && stalled.some((w) => lookupId(w.vendor)) ? vendorMap() : {},
+      ]);
 
       return stalled.map((w) => {
         const id = w.id;
@@ -1490,7 +1481,7 @@ const BUCKETS = {
           // — in particular every work order in this org is under 24h old, so
           // there is no "idle for N days" story to tell.
           priority: nameOf(w.priority) || "Normal",
-          tone: findingTone(nameOf(w.priority)), flag: "",
+          tone: priorityTone(nameOf(w.priority)), flag: "",
           meta, ai_note: "", age_label: age, status: state,
           site, tenant: "", vendor, requested_by: "",
           local_id: w.serialNumber ? String(w.serialNumber) : "",
@@ -1520,7 +1511,10 @@ const BUCKETS = {
     // server-side; the in-progress, reopen and vendor tests run here over the
     // one page that comes back.
     custom: true,
-    async loadRows() {
+    async loadRows(opts) {
+      // countOnly: the 30s counts poll only needs external_ids (built from the
+      // record id alone), so the display-only site/vendor name maps are skipped.
+      const countOnly = !!(opts && opts.countOnly);
       // Every work assignment, in one sweep: the same set supplies both the
       // candidates and the reopen evidence, so no second query is needed. No
       // `expand` (it triples the payload); names come from id→name maps.
@@ -1539,8 +1533,10 @@ const BUCKETS = {
       }
 
       const candidates = qualifyingSpotChecks(was);
-      const sites = candidates.length ? await siteMap() : {};
-      const vendors = candidates.length ? await vendorMap() : {};
+      const [sites, vendors] = await Promise.all([
+        !countOnly && candidates.length ? siteMap() : {},
+        !countOnly && candidates.length ? vendorMap() : {},
+      ]);
 
       return candidates.map((c) => {
         const w = c.wo;
@@ -1613,7 +1609,7 @@ async function vendorMap() {
     const m = {};
     for (const v of recs) m[v.id] = v.name;
     return m;
-  } catch (e) { return {}; }
+  } catch { return {}; }
 }
 
 // The external_ids already actioned in this bucket, as the bucket spells them
@@ -1629,7 +1625,7 @@ function hiddenSet(d, bucketId, aliases) {
         const eid = String(r.external_id);
         out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
       }
-    } catch (e) { /* a dead read must not un-hide everything */ }
+    } catch { /* a dead read must not un-hide everything */ }
   }
   return out;
 }
@@ -1652,23 +1648,18 @@ server.addHandler({
     const out = [];
     for (const [id, b] of Object.entries(BUCKETS)) {
       try {
-        let count;
         if (b.custom) {
-          const rows = await b.loadRows();
+          // countOnly: buckets that fetch display-only context (site/vendor
+          // names) skip it here — the count reads nothing but external_id.
+          const rows = await b.loadRows({ countOnly: true });
           const hidden = hiddenSet(d, id, b.aliases);
-          count = rows.filter((r) => !hidden.has(r.external_id)).length;
+          const count = rows.filter((r) => !hidden.has(r.external_id)).length;
           out.push({ bucket: id, label: b.label, signal: !!b.signal, count });
           continue;
         }
-        if (b.countMode === "length") {
-          const input = { page: 1, page_size: 200, select: "id" };
-          if (b.filters) input.filters = b.filters;
-          count = envelope(await callAction(b.connection, b.action, input)).records.length;
-        } else {
-          const input = { page: 1, page_size: 1, include_count: true, select: "id" };
-          if (b.filters) input.filters = b.filters;
-          count = envelope(await callAction(b.connection, b.action, input)).count || 0;
-        }
+        const input = { page: 1, page_size: 1, include_count: true, select: "id" };
+        if (b.filters) input.filters = b.filters;
+        const count = envelope(await callAction(b.connection, b.action, input)).count || 0;
         const hidden = hiddenCount(d, id, b.aliases);
         out.push({ bucket: id, label: b.label, signal: !!b.signal, count: Math.max(0, count - hidden) });
       } catch (e) {
@@ -1716,22 +1707,11 @@ server.addHandler({
     if (b.select) input.select = b.select;
     const { records, count } = envelope(await callAction(b.connection, b.action, input));
 
-    // context resolvers (e.g. vendor id -> name)
-    let ctxFor = () => ({});
-    if (b.resolveVendors) { const vm = await vendorMap(); ctxFor = (r) => ({ vendorName: vm[r.vendor && r.vendor.id] }); }
-
     const hidden = hiddenSet(d, id, b.aliases);
-    const jobs = records.map((r) => b.toRow(r, ctxFor(r))).filter((row) => !hidden.has(row.external_id));
+    const jobs = records.map((r) => b.toRow(r)).filter((row) => !hidden.has(row.external_id));
 
-    let rawTotal;
-    if (b.countMode === "length") {
-      const cin = { page: 1, page_size: 200, select: "id" };
-      if (b.filters) cin.filters = b.filters;
-      rawTotal = envelope(await callAction(b.connection, b.action, cin)).records.length;
-    } else {
-      rawTotal = count || records.length;
-    }
-    const total = Math.max(0, rawTotal - hiddenCount(d, id, b.aliases));
+    const rawTotal = count || records.length;
+    const total = Math.max(0, rawTotal - hidden.size);
     // Same per-page enrichment the custom path gets, for buckets whose rows come
     // from a live query (tsr). Outside loadRows/toRow by design: this handler
     // runs on page open, the counts poll does not reach it.
@@ -1978,7 +1958,7 @@ server.addHandler({
     // pull the full service request to source the rest of the payload
     const resp = await callAction("facilio-cmms", "list-service-requests", {
       filters: "id=" + srId,
-      expand: "siteId,tenant,tenant_serviceRequest_1,client,requester",
+      expand: "siteId,tenant,client",
       page_size: 1,
     });
     const sr = envelope(resp).records[0];
@@ -1986,7 +1966,7 @@ server.addHandler({
 
     const payload = buildTenantQuotePayload(sr, amount);
 
-    let created, syncError = null;
+    let created;
     try {
       created = await callAction("facilio-cmms", "create-quote", payload);
     } catch (e) {
@@ -1997,7 +1977,7 @@ server.addHandler({
     const d = db();
     upsertState(d, args.external_id, "true", "Create Tenant Quote (" + amount + ")", nowIso(), "synced");
     let quoteId = null;
-    try { const rec = envelope(created).records[0]; quoteId = rec && rec.id; } catch (e) {}
+    try { const rec = envelope(created).records[0]; quoteId = rec && rec.id; } catch {}
     return { ok: true, external_id: args.external_id, amount, quoteId };
   },
 });
@@ -2024,7 +2004,7 @@ async function invoicePricesForPO(po) {
       }
     }
     return map;
-  } catch (e) { return {}; }
+  } catch { return {}; }
 }
 
 server.addHandler({
@@ -2035,8 +2015,11 @@ server.addHandler({
     if (!args || !args.external_id) throw new Error("external_id is required");
     const seg = String(args.external_id).split(":");
     const poId = Number(seg[seg.length - 1]);
-    const po = envelope(await callAction("facilio-cmms", "get-purchase-order", { id: poId, expand: "lineItems,vendor" })).records[0]
-      || (await callAction("facilio-cmms", "get-purchase-order", { id: poId, expand: "lineItems,vendor" })).data;
+    // get-purchase-order answers with the single record under .data, which
+    // envelope() (arrays only) cannot extract — fetch once and derive both
+    // fallbacks from the same response.
+    const resp = await callAction("facilio-cmms", "get-purchase-order", { id: poId, expand: "lineItems,vendor" });
+    const po = envelope(resp).records[0] || (resp && resp.data);
     const rec = (po && po.lineItems) ? po : ((po && po.data) || po);
     const allLines = (rec && rec.lineItems) || [];
     const referred = allLines.filter((l) => !LINE_REFERRED_STATUS || String(nameOf(l.moduleState) || l.moduleState || "") === LINE_REFERRED_STATUS);
@@ -2068,7 +2051,7 @@ server.addHandler({
     const seg = String(args.external_id).split(":");
     const poId = Number(seg[seg.length - 1]);
     let updates = [];
-    try { updates = JSON.parse(args.updates || "[]"); } catch (e) { throw new Error("updates must be a JSON array"); }
+    try { updates = JSON.parse(args.updates || "[]"); } catch { throw new Error("updates must be a JSON array"); }
     if (!updates.length) throw new Error("no line updates provided");
 
     const lineItems = updates.map((u) => ({ id: u.lineId, unitPrice: Number(u.unitPrice) }));

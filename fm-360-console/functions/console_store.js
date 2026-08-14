@@ -66,9 +66,8 @@ const SIGNAL_COLS = [
 const NUM_COLS = {
   source_record_id: true, ai_confidence: true, priority_rank: true, vendor_id: true, metric_value: true,
   baseline_value: true, variance_value: true, variance_pct: true, occurrence_count: true, sample_size: true,
-  records_read: true, records_written: true,
 };
-// Stored as text (ISO 8601) because CSV import gives no timestamptz columns.
+// Serialized as JSON strings — the CSV-provisioned table has only text columns.
 const JSON_COLS = { action_suggestions: true, raw: true };
 
 const PRIORITY_RANK = { Critical: 0, High: 1, Medium: 2, Signal: 3, Normal: 3, Low: 4 };
@@ -155,6 +154,30 @@ server.addHandler({
 
 // ------------------------------------------------------------------- writes
 
+// upsert_jobs and upsert_signals differ only in whitelist, table, columns and
+// the noun in the rejection message — one body so fixes land in both.
+function bulkUpsert(args, table, cols, buckets, noun) {
+  let list = parseJson(args.items, "items");
+  if (!list) {
+    const one = parseJson(args.item, "item");
+    if (one) list = [one];
+  }
+  if (!list || !list.length) throw new Error("Provide items (JSON array) or item (JSON object)");
+  if (!Array.isArray(list)) throw new Error("items must be a JSON array");
+  const d = db();
+  const now = nowIso();
+  let inserted = 0, updated = 0;
+  const rejected = [];
+  for (const row of list) {
+    if (buckets.indexOf(row.bucket) < 0) {
+      rejected.push({ external_id: row.external_id, reason: `bucket '${row.bucket}' is not a ${noun} bucket (${buckets.join("|")})` });
+      continue;
+    }
+    upsert(d, table, cols, row, args.flow_run_id, now) === "inserted" ? inserted++ : updated++;
+  }
+  return { ok: true, total: list.length, inserted, updated, rejected };
+}
+
 server.addHandler({
   name: "upsert_jobs",
   description:
@@ -164,27 +187,7 @@ server.addHandler({
     item: { description: "JSON object string for a single job record", type: "string" },
     flow_run_id: { description: "Optional flow run id stamped on every record", type: "string" },
   },
-  execute: async (args) => {
-    let list = parseJson(args.items, "items");
-    if (!list) {
-      const one = parseJson(args.item, "item");
-      if (one) list = [one];
-    }
-    if (!list || !list.length) throw new Error("Provide items (JSON array) or item (JSON object)");
-    if (!Array.isArray(list)) throw new Error("items must be a JSON array");
-    const d = db();
-    const now = nowIso();
-    let inserted = 0, updated = 0;
-    const rejected = [];
-    for (const row of list) {
-      if (JOB_BUCKETS.indexOf(row.bucket) < 0) {
-        rejected.push({ external_id: row.external_id, reason: `bucket '${row.bucket}' is not a job bucket (${JOB_BUCKETS.join("|")})` });
-        continue;
-      }
-      upsert(d, "job_to_be_done", JOB_COLS, row, args.flow_run_id, now) === "inserted" ? inserted++ : updated++;
-    }
-    return { ok: true, total: list.length, inserted, updated, rejected };
-  },
+  execute: async (args) => bulkUpsert(args, "job_to_be_done", JOB_COLS, JOB_BUCKETS, "job"),
 });
 
 server.addHandler({
@@ -196,30 +199,32 @@ server.addHandler({
     item: { description: "JSON object string for a single signal record", type: "string" },
     flow_run_id: { description: "Optional flow run id stamped on every record", type: "string" },
   },
-  execute: async (args) => {
-    let list = parseJson(args.items, "items");
-    if (!list) {
-      const one = parseJson(args.item, "item");
-      if (one) list = [one];
-    }
-    if (!list || !list.length) throw new Error("Provide items (JSON array) or item (JSON object)");
-    if (!Array.isArray(list)) throw new Error("items must be a JSON array");
-    const d = db();
-    const now = nowIso();
-    let inserted = 0, updated = 0;
-    const rejected = [];
-    for (const row of list) {
-      if (SIGNAL_BUCKETS.indexOf(row.bucket) < 0) {
-        rejected.push({ external_id: row.external_id, reason: `bucket '${row.bucket}' is not a signal bucket (${SIGNAL_BUCKETS.join("|")})` });
-        continue;
-      }
-      upsert(d, "signal", SIGNAL_COLS, row, args.flow_run_id, now) === "inserted" ? inserted++ : updated++;
-    }
-    return { ok: true, total: list.length, inserted, updated, rejected };
-  },
+  execute: async (args) => bulkUpsert(args, "signal", SIGNAL_COLS, SIGNAL_BUCKETS, "signal"),
 });
 
 // -------------------------------------------------------------------- reads
+
+// list_jobs and list_signals differ only in table, sort order and result key.
+function listTable(args, table, orderBy, key) {
+  const d = db();
+  const conds = ["external_id <> '__seed__'"];
+  const p = [];
+  const status = args.status || "open";
+  if (status !== "all") { p.push(status); conds.push(`status = $${p.length}`); }
+  if (args.bucket) { p.push(args.bucket); conds.push(`bucket = $${p.length}`); }
+  const where = "where " + conds.join(" and ");
+  const limit = Math.min(Math.max(1, Number(args.limit) || 50), 200);
+  const offset = Math.max(0, Number(args.offset) || 0);
+  const total = d.query(`select count(*)::int as c from ${table} ${where}`, p).rows[0].c;
+  const { rows } = d.query(
+    `select * from ${table} ${where} order by ${orderBy} limit $${p.length + 1} offset $${p.length + 2}`,
+    p.concat([limit, offset])
+  );
+  for (const r of rows) {
+    try { r.action_suggestions = JSON.parse(r.action_suggestions || "[]"); } catch { r.action_suggestions = []; }
+  }
+  return { total, limit, offset, [key]: rows };
+}
 
 server.addHandler({
   name: "list_jobs",
@@ -230,28 +235,15 @@ server.addHandler({
     limit: { description: "Max rows (default 50, max 200)", type: "number" },
     offset: { description: "Rows to skip (default 0)", type: "number" },
   },
-  execute: async (args) => {
-    const d = db();
-    const conds = ["external_id <> '__seed__'"];
-    const p = [];
-    const status = args.status || "open";
-    if (status !== "all") { p.push(status); conds.push(`status = $${p.length}`); }
-    if (args.bucket) { p.push(args.bucket); conds.push(`bucket = $${p.length}`); }
-    const where = "where " + conds.join(" and ");
-    const limit = Math.min(Math.max(1, Number(args.limit) || 50), 200);
-    const offset = Math.max(0, Number(args.offset) || 0);
-    const total = d.query(`select count(*)::int as c from job_to_be_done ${where}`, p).rows[0].c;
-    const { rows } = d.query(
+  execute: async (args) =>
+    listTable(
+      args,
+      "job_to_be_done",
       // Live records always outrank seeded demo rows, whatever their priority —
       // a demonstration row must never sit above real work.
-      `select * from job_to_be_done ${where} order by (case when data_confidence = 'seeded' then 1 else 0 end) asc, coalesce(priority_rank,3) asc, detected_at desc limit $${p.length + 1} offset $${p.length + 2}`,
-      p.concat([limit, offset])
-    );
-    for (const r of rows) {
-      try { r.action_suggestions = JSON.parse(r.action_suggestions || "[]"); } catch (e) { r.action_suggestions = []; }
-    }
-    return { total, limit, offset, jobs: rows };
-  },
+      "(case when data_confidence = 'seeded' then 1 else 0 end) asc, coalesce(priority_rank,3) asc, detected_at desc",
+      "jobs"
+    ),
 });
 
 server.addHandler({
@@ -263,26 +255,7 @@ server.addHandler({
     limit: { description: "Max rows (default 50, max 200)", type: "number" },
     offset: { description: "Rows to skip (default 0)", type: "number" },
   },
-  execute: async (args) => {
-    const d = db();
-    const conds = ["external_id <> '__seed__'"];
-    const p = [];
-    const status = args.status || "open";
-    if (status !== "all") { p.push(status); conds.push(`status = $${p.length}`); }
-    if (args.bucket) { p.push(args.bucket); conds.push(`bucket = $${p.length}`); }
-    const where = "where " + conds.join(" and ");
-    const limit = Math.min(Math.max(1, Number(args.limit) || 50), 200);
-    const offset = Math.max(0, Number(args.offset) || 0);
-    const total = d.query(`select count(*)::int as c from signal ${where}`, p).rows[0].c;
-    const { rows } = d.query(
-      `select * from signal ${where} order by detected_at desc limit $${p.length + 1} offset $${p.length + 2}`,
-      p.concat([limit, offset])
-    );
-    for (const r of rows) {
-      try { r.action_suggestions = JSON.parse(r.action_suggestions || "[]"); } catch (e) { r.action_suggestions = []; }
-    }
-    return { total, limit, offset, signals: rows };
-  },
+  execute: async (args) => listTable(args, "signal", "detected_at desc", "signals"),
 });
 
 server.addHandler({

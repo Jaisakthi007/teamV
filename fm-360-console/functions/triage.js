@@ -10,7 +10,7 @@ function cfg(key) {
       if (process.env && process.env[key] != null) return process.env[key];
       if (process.system && process.system[key] != null) return process.system[key];
     }
-  } catch (e) {}
+  } catch {}
   return undefined;
 }
 function nameOf(v) {
@@ -46,7 +46,7 @@ async function callAction(connectionSlug, actionSlug, input) {
 async function tryRecords(connection, action, input) {
   try {
     return envelope(await callAction(connection, action, input)).records || [];
-  } catch (e) {
+  } catch {
     return null; // null = the read failed, distinct from "read fine, nothing there"
   }
 }
@@ -140,7 +140,8 @@ function score(item) {
   if (item.quote_path) add(12, "Quote path set", "purple");
   if (item.tenant) add(6, "Tenant-facing", "blue");
 
-  return { n, why, tones, tone: worstTone(tones) };
+  // `age` rides along so callers can report the exact age the ranking used.
+  return { n, why, tones, tone: worstTone(tones), age };
 }
 
 // Record deep links. Deliberately duplicated from feed.js rather than imported
@@ -148,14 +149,12 @@ function score(item) {
 // the web app's only generic resolver route is /:app/goto/summary/:moduleName/:id,
 // it matches moduleName EXACTLY against the route table (so `serviceRequest`,
 // not `servicerequest`), and anything unmatched lands on pagenotfound.
+// Only the modules this file's SOURCES actually link are kept — feed.js holds
+// the full table.
 const APP_BASE_URL = "https://app.facilio.com/maintenance";
 const LINKABLE_MODULES = {
-  servicerequest: "serviceRequest",
   serviceRequest: "serviceRequest",
-  workorder: "workorder",
   workpermit: "workpermit",
-  purchaseorder: "purchaseorder",
-  quote: "quote",
 };
 function recordUrl(module, id) {
   const canonical = LINKABLE_MODULES[String(module || "")];
@@ -182,7 +181,7 @@ const SOURCES = [
     },
     map: (r) => ({
       external_id: "tsr:servicerequest:" + r.id,
-      ref: "TSR-" + (r.localId && r.localId !== 0 ? r.localId : r.id),
+      ref: "TSR-" + (r.localId || r.id),
       title: r.subject || "(no subject)",
       created_time: r.sysCreatedTime || "",
       tenant: nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant),
@@ -200,7 +199,7 @@ const SOURCES = [
     input: { filters: "moduleState=awaitingfmapproval", expand: "vendor,siteId", page: 1, page_size: 50 },
     map: (r) => ({
       external_id: "unblock:workpermit:" + r.id,
-      ref: "PMT-" + (r.localId && r.localId !== 0 ? r.localId : r.id),
+      ref: "PMT-" + (r.localId || r.id),
       title: r.name || "Work permit " + r.id,
       created_time: r.sysCreatedTime || "",
       valid_from: r.expectedStartTime || "",
@@ -223,8 +222,12 @@ server.addHandler({
     const errors = {};
     const items = [];
 
-    for (const src of SOURCES) {
-      const rows = await tryRecords(src.connection, src.action, src.input);
+    // Independent reads, so fetch in parallel (tryRecords never throws) and
+    // process in SOURCES order to keep the output identical.
+    const results = await Promise.all(SOURCES.map((s) => tryRecords(s.connection, s.action, s.input)));
+    for (let i = 0; i < SOURCES.length; i++) {
+      const src = SOURCES[i];
+      const rows = results[i];
       if (rows == null) { scanned[src.bucket] = null; errors[src.bucket] = "read failed"; continue; }
       scanned[src.bucket] = rows.length;
       for (const r of rows) {
@@ -236,7 +239,7 @@ server.addHandler({
         items.push({
           ...base, bucket: src.bucket, bucket_label: src.label, score: s.n,
           why: s.why, why_tones: s.tones, tone: s.tone,
-          age_h: hoursSince(base.created_time) || 0,
+          age_h: s.age != null ? s.age : 0,
         });
       }
     }

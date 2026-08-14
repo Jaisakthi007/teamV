@@ -8,7 +8,6 @@
   /* surfaces */
   --canvas: #f7f8fa;
   --surface: #ffffff;
-  --surface-2: #fbfcfd;
   --hairline: #e6e8ec;
   --hairline-strong: #d7dbe2;
 
@@ -233,7 +232,6 @@ button { font-family: inherit; }
 .card__meta em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30ch; min-width: 0; }
 .card__row { display: flex; align-items: flex-start; gap: 16px; }
 .card__body { flex: 1; min-width: 0; }
-.card__side { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
 .card__actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 
 /* ------------------------------------------------------------ pills / chips */
@@ -248,7 +246,6 @@ button { font-family: inherit; }
 .pill--warning  { background: var(--warning-tint);  color: var(--warning-ink); }
 .pill--info     { background: var(--info-tint);     color: var(--info-ink); }
 .pill--success  { background: var(--success-tint);  color: var(--success-ink); }
-.pill--brand    { background: var(--brand-tint);    color: var(--brand-ink); }
 .pill__d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
 /* ---------------------------------------------------------------- buttons */
@@ -368,9 +365,6 @@ button { font-family: inherit; }
   background: var(--surface); border: 1px solid var(--hairline);
   border-radius: var(--radius-card); padding: 16px 18px 16px 20px;
 }
-
-@keyframes flashin { 0% { background: var(--info-tint); } 100% { background: var(--surface); } }
-.card--new { animation: flashin 1.6s ease-out 1; }
 
 /* ------------------------------------------------------------ glance strip */
 

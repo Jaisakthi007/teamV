@@ -19,14 +19,20 @@ const INTENT_AGENT = {
   review_permit: "review_work_permits",
 };
 
-// ---- helpers (same shape as feed.js so both read alike) ---------------------
+/** The turn's target agent: an explicit args.team overrides the intent's default. */
+function teamFor(args, intent) {
+  return (args && args.team) || INTENT_AGENT[intent] || DEFAULT_TEAM;
+}
+
+// ---- helpers (like feed.js's so both read alike; this envelope omits feed.js's
+// count field — nothing in this file reads it) --------------------------------
 function cfg(key) {
   try {
     if (typeof process !== "undefined") {
       if (process.env && process.env[key] != null) return process.env[key];
       if (process.system && process.system[key] != null) return process.system[key];
     }
-  } catch (e) {}
+  } catch {}
   return undefined;
 }
 function nowIso() { return new Date().toISOString().replace(/\.\d{3}Z$/, "Z"); }
@@ -37,9 +43,8 @@ function nameOf(v) {
   return String(v);
 }
 function envelope(j) {
-  if (!j) return { records: [], count: null };
-  const out = { records: [], count: null };
-  if (typeof j.count === "number") out.count = j.count;
+  if (!j) return { records: [] };
+  const out = { records: [] };
   const cands = [j.data, j.output && j.output.data, j.result && j.result.data, j.response && j.response.data, j.output, j.result];
   for (const c of cands) { if (Array.isArray(c)) { out.records = c; break; } }
   if (!out.records.length && Array.isArray(j)) out.records = j;
@@ -57,7 +62,7 @@ async function callAction(connectionSlug, actionSlug, input) {
   if (!res.ok) {
     throw new Error(`${connectionSlug}.${actionSlug} failed: ${res.status} ${res.statusText} ${text.slice(0, 200)}`);
   }
-  try { return JSON.parse(text); } catch (e) { return { raw: text }; }
+  try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
 /** Thread ids come back at different depths depending on the envelope. */
@@ -92,7 +97,7 @@ function replyOf(resp) {
 /** external_id is "<bucket>:<module>:<id>" — the record id is the last segment. */
 function recordIdOf(externalId) {
   const seg = String(externalId || "").split(":");
-    const n = Number(seg[seg.length - 1]);
+  const n = Number(seg[seg.length - 1]);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
@@ -117,14 +122,14 @@ function num(n) {
 }
 
 /** Names out of a picklist/list payload, whatever key the module uses for the label. */
-function optionNames(resp, limit) {
+function optionNames(resp) {
   const rows = (resp && (resp.items || resp.data)) || envelope(resp).records || [];
   const names = [];
   for (const r of rows) {
     const n = typeof r === "string" ? r : (r && (r.displayName || r.name || r.type || r.priority));
     if (n) names.push(String(n));
   }
-  return names.slice(0, limit || 40);
+  return names.slice(0, 40);
 }
 
 /**
@@ -295,18 +300,30 @@ async function procurementContext(siteId, siteName) {
 async function tryAct(connection, action, input) {
   try {
     return await callAction(connection, action, input);
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
-async function briefingFor(srId) {
-  // get-service-request returns the record already expanded; the list action's
-  // id= filter does not match, so don't reach for it here.
-  const resp = await callAction("facilio-cmms", "get-service-request", { id: srId });
-  const sr = (resp && resp.data && typeof resp.data === "object" && !Array.isArray(resp.data))
+/**
+ * The service request record, unwrapped. get-service-request returns it already
+ * expanded (the list action's id= filter does not match, so don't reach for
+ * that). Errors propagate — callers pick their own failure semantics.
+ */
+async function fetchSr(id) {
+  const resp = await callAction("facilio-cmms", "get-service-request", { id });
+  return (resp && resp.data && typeof resp.data === "object" && !Array.isArray(resp.data))
     ? resp.data
     : envelope(resp).records[0];
+}
+
+/** The record's state label, or the raw state when it carries no name. */
+function stateLabel(sr) {
+  return nameOf(sr.moduleState) || String(sr.moduleState ?? "");
+}
+
+async function briefingFor(srId) {
+  const sr = await fetchSr(srId);
   if (!sr || sr.id == null) throw new Error("service request " + srId + " not found");
 
   // get-service-request nests the site under the building and leaves the top-level
@@ -555,7 +572,7 @@ async function recoverEmptyReply(threadId, team) {
       threadId, agent: team, message: EMPTY_TURN_PROBE,
     });
     return replyOf(run);
-  } catch (e) {
+  } catch {
     return null; // aborted or failed — the caller falls back to the honest string
   }
 }
@@ -563,12 +580,9 @@ async function recoverEmptyReply(threadId, team) {
 /** The record's current state label — the fastest truth about whether a write landed. */
 async function stateOf(srId) {
   try {
-    const resp = await callAction("facilio-cmms", "get-service-request", { id: srId });
-    const sr = (resp && resp.data && typeof resp.data === "object" && !Array.isArray(resp.data))
-      ? resp.data
-      : envelope(resp).records[0];
-    return sr ? (nameOf(sr.moduleState) || String(sr.moduleState ?? "")) : null;
-  } catch (e) {
+    const sr = await fetchSr(srId);
+    return sr ? stateLabel(sr) : null;
+  } catch {
     return null;
   }
 }
@@ -713,8 +727,7 @@ async function runStart(args, progress) {
   const recordId = (args && args.sr_id) ? Number(args.sr_id) : recordIdOf(args && args.external_id);
   if (!recordId) throw new Error("external_id or sr_id is required");
   const intent = String((args && args.intent) || "acknowledge");
-  // Target agent comes from the intent; an explicit args.team overrides.
-  const team = (args && args.team) || INTENT_AGENT[intent] || DEFAULT_TEAM;
+  const team = teamFor(args, intent);
   const who = args && args.actor
     ? ` The ${intent === "review_permit" ? "reviewer" : "FM"} acting is ${args.actor}.`
     : "";
@@ -729,20 +742,25 @@ async function runStart(args, progress) {
     briefing = permitBriefing(recordId, args);
     title = "FM 360 Console · Permit " + recordId;
   } else {
-    const { sr, siteId, site, briefing: record } = await briefingFor(recordId);
-    stateBefore = nameOf(sr.moduleState) || String(sr.moduleState ?? "");
     // Raising a work order needs picklists the agent would otherwise fetch one at
     // a time mid-run; a bare acknowledge needs none of them, so only pay for them
     // on the intents that actually reach the work-order step. tsr_flow does reach
     // it — it acknowledges and then carries on to the work order in the same
     // thread — so it gets the same pre-fetch, which is what took that turn from
-    // ~84s down to ~12s. The procurement initiation and the RFQ both follow in
-    // this same thread, so the policy reads are worth paying for on the same turn
-    // — all of them in parallel, so the extra reads cost no extra wall clock.
+    // ~84s down to ~12s. The picklists don't depend on the briefing, so they start
+    // before it (workOrderOptions never rejects — every read inside is a tryAct);
+    // only the policy reads need the briefing's siteId. The procurement initiation
+    // and the RFQ both follow in this same thread, so those reads are worth paying
+    // for on the same turn.
+    const optionsP = (intent === "create_work_order" || intent === "tsr_flow")
+      ? workOrderOptions()
+      : null;
+    const { sr, siteId, site, briefing: record } = await briefingFor(recordId);
+    stateBefore = stateLabel(sr);
     briefing = record;
-    if (intent === "create_work_order" || intent === "tsr_flow") {
+    if (optionsP) {
       const [options, policy] = await Promise.all([
-        workOrderOptions(),
+        optionsP,
         procurementContext(siteId, site),
       ]);
       briefing += options + policy;
@@ -770,7 +788,7 @@ async function runStart(args, progress) {
   // The briefing rides along with the first message too, so the agent acts on the
   // record's real state even if one-shot context is trimmed.
   const turn = await chatTurn(threadId, team, `${briefing}\n\n${message}`, {
-    srId: stateBefore != null ? recordId : null,
+    srId: intent === "review_permit" ? null : recordId,
     stateBefore,
     progress,
   });
@@ -784,7 +802,7 @@ async function runSend(args, progress) {
   const message = String((args && args.message) || "").trim();
   if (!message) throw new Error("message is required");
   const intent = String((args && args.intent) || "");
-  const team = (args && args.team) || INTENT_AGENT[intent] || DEFAULT_TEAM;
+  const team = teamFor(args, intent);
 
   // Snapshot the record's state up front so an aborted turn can detect the
   // write landing without waiting out the slow chat recovery. Service requests

@@ -25,7 +25,7 @@ async function callAction(connectionSlug, actionSlug, input) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`${connectionSlug}.${actionSlug} ${res.status}: ${text.slice(0, 250)}`);
-  try { return JSON.parse(text); } catch (e) { return { raw: text }; }
+  try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
 const cmms = (slug, input) => callAction("facilio-cmms", slug, input);
@@ -103,7 +103,6 @@ const SR_RATING_FIELD = "feedback_rating_serviceRequest";
 /* The purchase-order list action ACCEPTS a `filters` string, reports success and
    then ignores it — asking for `referred` returns `draft` rows. Verified live.
    So every PO bucket pages the module and filters in code instead. */
-const PO_FILTER_IS_BROKEN = true;
 
 /* ------------------------------------------------------------- db writing */
 
@@ -136,10 +135,28 @@ function coerce(col, v) {
   return typeof v === "string" ? v : String(v);
 }
 
-const rankOf = (p) => ({ Critical: 0, High: 1, Medium: 2, Normal: 3, Low: 4 }[p] != null ? { Critical: 0, High: 1, Medium: 2, Normal: 3, Low: 4 }[p] : 3);
+const PRIORITY_RANK = { Critical: 0, High: 1, Medium: 2, Normal: 3, Low: 4 };
+const rankOf = (p) => (PRIORITY_RANK[p] != null ? PRIORITY_RANK[p] : 3);
 
 // The tables were provisioned by CSV import, so there is no unique index on
 // external_id and ON CONFLICT is unavailable — update first, insert if absent.
+// Shared by the job and signal upserts, which differ only in table, column list
+// and coercer; each caller applies its own defaults before calling.
+function upsertRow(d, table, allCols, coerceFn, r, now) {
+  const setCols = allCols.filter((c) => c !== "external_id");
+  const upd = d.query(
+    `update ${table} set ${setCols.map((c, i) => `${c} = $${i + 2}`).join(", ")}, updated_at = $${setCols.length + 2} where external_id = $1`,
+    [r.external_id].concat(setCols.map((c) => coerceFn(c, r[c]))).concat([now])
+  );
+  if (upd.rowCount && upd.rowCount > 0) return "updated";
+  const cols = allCols.concat(["created_at", "updated_at"]);
+  d.query(
+    `insert into ${table} (${cols.join(", ")}) values (${cols.map((_, i) => `$${i + 1}`).join(", ")})`,
+    cols.map((c) => (c === "created_at" || c === "updated_at" ? now : coerceFn(c, r[c])))
+  );
+  return "inserted";
+}
+
 function upsertJob(d, row, now, flowRunId) {
   const r = { ...row };
   r.bucket_label = r.bucket_label || BUCKET_LABELS[r.bucket] || r.bucket;
@@ -149,26 +166,14 @@ function upsertJob(d, row, now, flowRunId) {
   r.priority_rank = rankOf(r.priority);
   r.flow_run_id = r.flow_run_id || flowRunId || "";
   r.agent_name = r.agent_name || "sweep_jobs";
-
-  const setCols = JOB_COLS.filter((c) => c !== "external_id");
-  const upd = d.query(
-    `update job_to_be_done set ${setCols.map((c, i) => `${c} = $${i + 2}`).join(", ")}, updated_at = $${setCols.length + 2} where external_id = $1`,
-    [r.external_id].concat(setCols.map((c) => coerce(c, r[c]))).concat([now])
-  );
-  if (upd.rowCount && upd.rowCount > 0) return "updated";
-  const cols = JOB_COLS.concat(["created_at", "updated_at"]);
-  d.query(
-    `insert into job_to_be_done (${cols.join(", ")}) values (${cols.map((_, i) => `$${i + 1}`).join(", ")})`,
-    cols.map((c) => (c === "created_at" || c === "updated_at" ? now : coerce(c, r[c])))
-  );
-  return "inserted";
+  return upsertRow(d, "job_to_be_done", JOB_COLS, coerce, r, now);
 }
 
 /* Seed fallback for buckets with no live source in this org. Rows are marked
    data_confidence='seeded' so a demo row is never mistaken for a real finding. */
 function seedRows(d, bucket, limit) {
   const { rows } = d.query(
-    "select external_id, ref, title, meta, priority, tone, flag, ai_note, site, tenant, vendor, requested_by, record_url, actions, status from console_jobs where bucket = $1 limit $2",
+    "select external_id, ref, title, meta, priority, tone, flag, ai_note, site, tenant, vendor, requested_by, record_url from console_jobs where bucket = $1 limit $2",
     [bucket, limit || 25]
   );
   return rows;
@@ -315,7 +320,7 @@ COLLECTORS.tsrack = async (ctx) => {
 
 /* referral + completion — purchase orders, filtered in code because the
    module's own filters param is ignored. */
-async function poBucket(bucket, wantState, build) {
+async function poBucket(wantState, build) {
   const all = await listAll("list-purchase-orders", { sort_by: "sysModifiedTime", sort_order: "desc", expand: "vendor", page_size: 200 }, 5);
   const matched = all.filter((p) => stateOf(p) === wantState);
   return {
@@ -326,7 +331,7 @@ async function poBucket(bucket, wantState, build) {
 }
 
 COLLECTORS.referral = () =>
-  poBucket("referral", PO_REFERRED, (p) => ({
+  poBucket(PO_REFERRED, (p) => ({
     external_id: `referral:purchaseorder:${p.id}`,
     bucket: "referral", source_module: "purchaseorder", source_record_id: p.id,
     ref: "PO-" + (p.localId || p.id),
@@ -343,7 +348,7 @@ COLLECTORS.referral = () =>
   }));
 
 COLLECTORS.completion = () =>
-  poBucket("completion", PO_ACTIVE, (p) => ({
+  poBucket(PO_ACTIVE, (p) => ({
     external_id: `completion:purchaseorder:${p.id}`,
     bucket: "completion", source_module: "purchaseorder", source_record_id: p.id,
     ref: "PO-" + (p.localId || p.id),
@@ -395,11 +400,10 @@ COLLECTORS.tenant = async () => {
 COLLECTORS.stalled = async (ctx) => {
   const wos = await listAll("list-work-orders", { sort_by: "createdTime", sort_order: "desc", expand: "siteId,vendor", page_size: 100 }, 3);
   const alive = wos.filter((w) => WO_DEAD.indexOf(stateOf(w)) < 0);
-  const stale = alive.filter((w) => {
-    const h = hoursSince(w.createdTime || w.sysCreatedTime);
-    return h != null && h > 48;
-  });
-  const rows = stale.map((w) => ({
+  const stale = alive
+    .map((w) => ({ w, idleH: hoursSince(w.createdTime || w.sysCreatedTime) }))
+    .filter(({ idleH }) => idleH != null && idleH > 48);
+  const rows = stale.map(({ w, idleH }) => ({
     external_id: `stalled:workorder:${w.id}`,
     bucket: "stalled", source_module: "workorder", source_record_id: w.id,
     ref: "WO-" + (w.localId || w.id),
@@ -407,7 +411,7 @@ COLLECTORS.stalled = async (ctx) => {
     meta: ["Work order", stateOf(w), nameOf(w.siteId) || nameOf(w.site)].filter(Boolean).join(" · "),
     what_needs_to_be_done: "Initiate procurement for this work order — it has been idle since it was raised.",
     priority: "Medium", tone: "warning",
-    flag: "Idle " + Math.floor(hoursSince(w.createdTime || w.sysCreatedTime) / 24) + " d",
+    flag: "Idle " + Math.floor(idleH / 24) + " d",
     age_label: ageLabel(w.createdTime || w.sysCreatedTime), source_state: stateOf(w),
     site: nameOf(w.siteId) || nameOf(w.site), vendor: nameOf(w.vendor),
     ai_note: "This org exposes no procurement-initiation or RFQ list action, so only the missing purchase order could be verified.",
@@ -477,10 +481,34 @@ const JOB_BUCKETS = ["tsr", "tsrack", "unblock", "referral", "completion", "find
 
 /* -------------------------------------------------------------- handlers */
 
+const runId = (prefix, now) => prefix + now.replace(/[-:.TZ]/g, "").slice(0, 14);
+
+/* flow_run bookkeeping shared by the job sweep and the signal pass. */
+function flowRunStart(d, flowRunId, bucket, agent) {
+  d.query(
+    `insert into flow_run (flow_run_id, bucket, agent_name, status, records_read, records_written, error, started_at, finished_at) values ($1,$2,'${agent}','running',0,0,'',$3,'')`,
+    [flowRunId, bucket, nowIso()]
+  );
+}
+
+function flowRunOk(d, flowRunId, bucket, read, written, note) {
+  d.query(
+    "update flow_run set status='ok', records_read=$3, records_written=$4, error=$5, finished_at=$6 where flow_run_id=$1 and bucket=$2",
+    [flowRunId, bucket, read, written, note, nowIso()]
+  );
+}
+
+function flowRunError(d, flowRunId, bucket, msg) {
+  d.query(
+    "update flow_run set status='error', error=$3, finished_at=$4 where flow_run_id=$1 and bucket=$2",
+    [flowRunId, bucket, msg, nowIso()]
+  );
+}
+
 async function doRun(args) {
     const d = db();
     const now = nowIso();
-    const flowRunId = (args && args.flow_run_id) || "sweep-" + now.replace(/[-:.TZ]/g, "").slice(0, 14);
+    const flowRunId = (args && args.flow_run_id) || runId("sweep-", now);
     const windowHours = Number(args && args.window_hours) || 24;
     const want = args && args.buckets
       ? String(args.buckets).split(",").map((s) => s.trim()).filter(Boolean)
@@ -493,11 +521,7 @@ async function doRun(args) {
     for (const bucket of want) {
       const collect = COLLECTORS[bucket];
       if (!collect) { results.push({ bucket, ok: false, error: "unknown bucket" }); continue; }
-      const startedAt = nowIso();
-      d.query(
-        "insert into flow_run (flow_run_id, bucket, agent_name, status, records_read, records_written, error, started_at, finished_at) values ($1,$2,'sweep_jobs','running',0,0,'',$3,'')",
-        [flowRunId, bucket, startedAt]
-      );
+      flowRunStart(d, flowRunId, bucket, "sweep_jobs");
       try {
         const res = await collect(ctx);
         const read = res.read;
@@ -521,17 +545,11 @@ async function doRun(args) {
           upsertJob(d, row, now, flowRunId) === "inserted" ? ins++ : upd++;
         }
         inserted += ins; updated += upd;
-        d.query(
-          "update flow_run set status='ok', records_read=$3, records_written=$4, error=$5, finished_at=$6 where flow_run_id=$1 and bucket=$2",
-          [flowRunId, bucket, read, rows.length, note || "", nowIso()]
-        );
+        flowRunOk(d, flowRunId, bucket, read, rows.length, note || "");
         results.push({ bucket, ok: true, read, written: rows.length, inserted: ins, updated: upd, seeded, note });
       } catch (e) {
         const msg = String(e && e.message ? e.message : e).slice(0, 300);
-        d.query(
-          "update flow_run set status='error', error=$3, finished_at=$4 where flow_run_id=$1 and bucket=$2",
-          [flowRunId, bucket, msg, nowIso()]
-        );
+        flowRunError(d, flowRunId, bucket, msg);
         results.push({ bucket, ok: false, error: msg });
       }
     }
@@ -563,22 +581,28 @@ server.addHandler({
   description: "Count candidate source records per bucket without writing anything.",
   parameters: {},
   execute: async () => {
-    const out = {};
     const day = isoAgo(24);
-    const tryIt = async (k, fn) => { try { out[k] = await fn(); } catch (e) { out[k] = "ERROR: " + String(e.message || e).slice(0, 140); } };
-    await tryIt("sr_submitted_last_day", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_SUBMITTED}&sysCreatedTime(is_after)=${day}`, page_size: 200 })).length);
-    await tryIt("sr_acknowledged", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_ACKNOWLEDGED}`, page_size: 200 })).length);
-    await tryIt("sr_closed", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_CLOSED}`, page_size: 200 })).length);
-    await tryIt("workorders", async () => rowsOf(await cmms("list-work-orders", { page_size: 200 })).length);
-    await tryIt("inspections", async () => rowsOf(await cmms("list-inspections", { page_size: 200 })).length);
-    await tryIt("workpermits", async () => rowsOf(await cmms("list-work-permits", { page_size: 200 })).length);
-    await tryIt("quotes", async () => rowsOf(await cmms("list-quotes", { page_size: 200 })).length);
-    await tryIt("po_states", async () => {
-      const all = await listAll("list-purchase-orders", { page_size: 200 }, 5);
-      const byState = {};
-      for (const p of all) { const s = stateOf(p) || "(none)"; byState[s] = (byState[s] || 0) + 1; }
-      return { scanned: all.length, byState };
-    });
+    // The eight reads are independent, so they run concurrently. Each resolves to
+    // a [key, value] pair and `out` is filled in the array's fixed order, keeping
+    // the returned JSON identical to the old sequential version.
+    const tryIt = async (k, fn) => { try { return [k, await fn()]; } catch (e) { return [k, "ERROR: " + String(e.message || e).slice(0, 140)]; } };
+    const pairs = await Promise.all([
+      tryIt("sr_submitted_last_day", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_SUBMITTED}&sysCreatedTime(is_after)=${day}`, page_size: 200 })).length),
+      tryIt("sr_acknowledged", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_ACKNOWLEDGED}`, page_size: 200 })).length),
+      tryIt("sr_closed", async () => rowsOf(await cmms("list-service-requests", { filters: `moduleState=${SR_CLOSED}`, page_size: 200 })).length),
+      tryIt("workorders", async () => rowsOf(await cmms("list-work-orders", { page_size: 200 })).length),
+      tryIt("inspections", async () => rowsOf(await cmms("list-inspections", { page_size: 200 })).length),
+      tryIt("workpermits", async () => rowsOf(await cmms("list-work-permits", { page_size: 200 })).length),
+      tryIt("quotes", async () => rowsOf(await cmms("list-quotes", { page_size: 200 })).length),
+      tryIt("po_states", async () => {
+        const all = await listAll("list-purchase-orders", { page_size: 200 }, 5);
+        const byState = {};
+        for (const p of all) { const s = stateOf(p) || "(none)"; byState[s] = (byState[s] || 0) + 1; }
+        return { scanned: all.length, byState };
+      }),
+    ]);
+    const out = {};
+    for (const [k, v] of pairs) out[k] = v;
     return { checkedAt: nowIso(), counts: out };
   },
 });
@@ -643,19 +667,7 @@ function upsertSignal(d, row, now, flowRunId) {
   r.detected_at = r.detected_at || now;
   r.flow_run_id = r.flow_run_id || flowRunId || "";
   r.agent_name = r.agent_name || "fm360-signal-analyst";
-
-  const setCols = SIGNAL_COLS.filter((c) => c !== "external_id");
-  const upd = d.query(
-    `update signal set ${setCols.map((c, i) => `${c} = $${i + 2}`).join(", ")}, updated_at = $${setCols.length + 2} where external_id = $1`,
-    [r.external_id].concat(setCols.map((c) => coerceSignal(c, r[c]))).concat([now])
-  );
-  if (upd.rowCount && upd.rowCount > 0) return "updated";
-  const cols = SIGNAL_COLS.concat(["created_at", "updated_at"]);
-  d.query(
-    `insert into signal (${cols.join(", ")}) values (${cols.map((_, i) => `$${i + 1}`).join(", ")})`,
-    cols.map((c) => (c === "created_at" || c === "updated_at" ? now : coerceSignal(c, r[c])))
-  );
-  return "inserted";
+  return upsertRow(d, "signal", SIGNAL_COLS, coerceSignal, r, now);
 }
 
 /* A no-tool agent call: the data goes IN through the prompt and structured
@@ -697,7 +709,7 @@ async function askAgent(agentLink, title, message) {
   if (!content) throw new Error("no content in agent reply: " + JSON.stringify(reply).slice(0, 200));
   try {
     return typeof content === "string" ? JSON.parse(content) : content;
-  } catch (e) {
+  } catch {
     throw new Error("agent reply was not JSON: " + String(content).slice(0, 200));
   }
 }
@@ -953,6 +965,30 @@ function bytesFromLatin1(str) {
   const b = new Uint8Array(str.length);
   for (let i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 255;
   return b;
+}
+
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// No Buffer or atob in this sandbox, so base64 is decoded by hand. Shared by the
+// quoting rate-card document reader and the invoicing FSR reader.
+function b64ToBytes(s) {
+  const clean = String(s || "").replace(/[^A-Za-z0-9+/]/g, "");
+  const out = [];
+  for (let i = 0; i < clean.length; i += 4) {
+    const c0 = B64_ALPHABET.indexOf(clean.charAt(i)), c1 = B64_ALPHABET.indexOf(clean.charAt(i + 1));
+    const h2 = clean.charAt(i + 2), h3 = clean.charAt(i + 3);
+    const c2 = h2 ? B64_ALPHABET.indexOf(h2) : 0, c3 = h3 ? B64_ALPHABET.indexOf(h3) : 0;
+    if (c0 < 0 || c1 < 0) break;
+    const n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+    out.push((n >> 16) & 255);
+    if (h2) out.push((n >> 8) & 255);
+    if (h3) out.push(n & 255);
+  }
+  return new Uint8Array(out);
+}
+
+function bytesToText(bytes) {
+  try { return new TextDecoder("utf-8").decode(bytes); } catch { return ""; }
 }
 
 function unescapePdfString(s) {
@@ -1274,7 +1310,7 @@ async function contractStatus(contractId, cache) {
   return res;
 }
 
-async function quotingEvidence(d) {
+async function quotingEvidence() {
   const cards = await loadRateCards();
   if (!cards.priced && !cards.docOnly) {
     return {
@@ -1299,7 +1335,7 @@ async function quotingEvidence(d) {
     try {
       const full = await cmms("get-quote", { id: q.id });
       lines = ((full && full.data && full.data.lineItems) || []);
-    } catch (e) {
+    } catch {
       continue;
     }
     if (!lines.length) continue;
@@ -1333,7 +1369,7 @@ async function quotingEvidence(d) {
         if (it.lineId) bands[String(it.lineId)] = { band: it.band, reasoning: it.reasoning, confidence: it.confidence, by: "agent" };
       }
       okChunks++;
-    } catch (e) {
+    } catch {
       failChunks++;
     }
   }
@@ -1437,29 +1473,6 @@ async function quotingEvidence(d) {
    (b) field service report vs invoice, agent-read, dormant until an FSR file
    is uploaded to custom_polineinvoices. */
 
-const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-// No Buffer or atob in this sandbox, so base64 is decoded by hand.
-function b64ToBytes(s) {
-  const clean = String(s || "").replace(/[^A-Za-z0-9+/]/g, "");
-  const out = [];
-  for (let i = 0; i < clean.length; i += 4) {
-    const c0 = B64_ALPHABET.indexOf(clean.charAt(i)), c1 = B64_ALPHABET.indexOf(clean.charAt(i + 1));
-    const h2 = clean.charAt(i + 2), h3 = clean.charAt(i + 3);
-    const c2 = h2 ? B64_ALPHABET.indexOf(h2) : 0, c3 = h3 ? B64_ALPHABET.indexOf(h3) : 0;
-    if (c0 < 0 || c1 < 0) break;
-    const n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
-    out.push((n >> 16) & 255);
-    if (h2) out.push((n >> 8) & 255);
-    if (h3) out.push(n & 255);
-  }
-  return new Uint8Array(out);
-}
-
-function bytesToText(bytes) {
-  try { return new TextDecoder("utf-8").decode(bytes); } catch (e) { return ""; }
-}
-
 /* Reads an FSR file field and returns plain text.
    Two verified traps handled here:
    - download-a-file-field returns HTTP 400/404 INSIDE ok:true, base64-encoded
@@ -1516,12 +1529,12 @@ async function fsrForPo(poId) {
       page_size: 50,
     }, 1);
     return rows;
-  } catch (e) {
+  } catch {
     return [];
   }
 }
 
-async function invoicingEvidence(d, opts) {
+async function invoicingEvidence(opts) {
   const cap = (opts && opts.cap) || 25;
   const invoices = await listAll("list-invoices", {
     expand: "purchaseOrder,vendor", sort_by: "sysModifiedTime", sort_order: "desc", page_size: 200,
@@ -1555,7 +1568,7 @@ async function invoicingEvidence(d, opts) {
     try {
       const full = await cmms("get-invoice", { id: m.inv.id });
       invLines = (full && full.data && full.data.lineItems) || [];
-    } catch (e) {}
+    } catch { /* header totals still compare below */ }
     let poReadError = null;
     try {
       const poFull = await callAction("cbre-clone", "get-purchase-order", { po_id: poId });
@@ -1637,7 +1650,7 @@ async function invoicingEvidence(d, opts) {
     const fsrNote = !fsrRows.length
       ? "No field service report is attached to this order, so hours and parts could not be verified against a report."
       : fsr && fsr.readable
-        ? `Field service report read via ${fsr.via}; ${((fsr.audit && fsr.audit.discrepancies) || []).length} discrepancy(ies) found.`
+        ? `Field service report read via ${fsr.via}; ${fsrFindings.length} discrepancy(ies) found.`
         : `A field service report is attached but could not be read: ${(fsr && fsr.reason) || "unknown reason"}.`;
 
     items.push({
@@ -1752,12 +1765,12 @@ async function loadSlaConfig() {
       if (s.displayName) idByName[String(s.displayName).toLowerCase()] = s.id;
       if (s.pauseSLA === true) paused[String(s.id)] = true;
     }
-  } catch (e) {}
+  } catch { /* state list is an enrichment; the policy still evaluates without it */ }
 
   return { policyId, policyName: detail && detail.name, criteria: detail && detail.criteria, entities, byPriority, paused, stateName, idByName };
 }
 
-async function slaEvidence(d) {
+async function slaEvidence() {
   const cfg = await loadSlaConfig();
   if (!cfg) {
     return { items: [], note: "No active SLA policy is configured for work orders, so no breach could be evaluated." };
@@ -1910,7 +1923,7 @@ function entityLabel(list) {
 async function doSignals(args) {
     const d = db();
     const now = nowIso();
-    const flowRunId = (args && args.flow_run_id) || "sweep-" + now.replace(/[-:.TZ]/g, "").slice(0, 14);
+    const flowRunId = (args && args.flow_run_id) || runId("sweep-", now);
 
     // Each detector reads real records and computes its own comparison. There is
     // no seed fallback here: a detector that finds nothing writes nothing and
@@ -1920,9 +1933,9 @@ async function doSignals(args) {
       : ["quoting", "invoicing", "sla"];
 
     const DETECTORS = {
-      quoting: () => quotingEvidence(d),
-      invoicing: () => invoicingEvidence(d, { cap: Number(args && args.invoice_cap) || 25 }),
-      sla: () => slaEvidence(d),
+      quoting: () => quotingEvidence(),
+      invoicing: () => invoicingEvidence({ cap: Number(args && args.invoice_cap) || 25 }),
+      sla: () => slaEvidence(),
     };
 
     let evidence = [];
@@ -1930,26 +1943,16 @@ async function doSignals(args) {
     for (const bucket of want) {
       const run = DETECTORS[bucket];
       if (!run) { notes[bucket] = "unknown signal bucket"; continue; }
-      const startedAt = nowIso();
-      d.query(
-        "insert into flow_run (flow_run_id, bucket, agent_name, status, records_read, records_written, error, started_at, finished_at) values ($1,$2,'sweep_signals','running',0,0,'',$3,'')",
-        [flowRunId, bucket, startedAt]
-      );
+      flowRunStart(d, flowRunId, bucket, "sweep_signals");
       try {
         const res = await run();
         evidence = evidence.concat(res.items || []);
         notes[bucket] = res.note || "";
-        d.query(
-          "update flow_run set status='ok', records_read=$3, records_written=$4, error=$5, finished_at=$6 where flow_run_id=$1 and bucket=$2",
-          [flowRunId, bucket, (res.items || []).length, (res.items || []).length, res.note || "", nowIso()]
-        );
+        flowRunOk(d, flowRunId, bucket, (res.items || []).length, (res.items || []).length, res.note || "");
       } catch (e) {
         const msg = String(e && e.message ? e.message : e).slice(0, 300);
         notes[bucket] = "ERROR: " + msg;
-        d.query(
-          "update flow_run set status='error', error=$3, finished_at=$4 where flow_run_id=$1 and bucket=$2",
-          [flowRunId, bucket, msg, nowIso()]
-        );
+        flowRunError(d, flowRunId, bucket, msg);
       }
     }
 
@@ -2190,7 +2193,7 @@ server.addHandler({
   },
   execute: async (args) => {
     const now = nowIso();
-    const flowRunId = "daily-" + now.replace(/[-:.TZ]/g, "").slice(0, 14);
+    const flowRunId = runId("daily-", now);
     const out = { flowRunId, ranAt: now };
 
     // Each stage is independent: a failure in one must not lose the others.

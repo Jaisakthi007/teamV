@@ -14,7 +14,9 @@ const IMPORTANT_LIMIT = 12;
 // Vibe app agent that decides who must act on a finding (Tenant | FM | Unclear).
 const FINDING_CLASSIFIER = "finding-classifier";
 // What the composer's header calls each intent's agent; anything unlisted is
-// the Service Request Operations team.
+// the Service Request Operations team. Dormant today: feed.js emits only
+// tsr_flow and create_work_order, so review_permit (and LOAD_PERMIT below) wait
+// for the feed to re-add a permit-review agent action; the CLI still uses it.
 const AGENT_TITLES = { review_permit: "Review Work Permits" };
 
 // `tsrack` is gone: "TSR's to acknowledge" and "Acknowledged TSRs" are ONE queue
@@ -68,6 +70,14 @@ function ageInfo(iso) {
   const sev = hrs >= 48 ? "critical" : hrs >= 8 ? "warning" : "info";
   return { label: "Waiting " + label, sev, exact: fmtDateTime(iso) };
 }
+// One derivation shared by Card and ContextPanel: how old the record is, which
+// severity paints it, and which actions (and primary verb) it offers.
+function jobView(job) {
+  const age = ageInfo(job.created_time);
+  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
+  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
+  return { age, sev, acts, primary: acts.find((a) => a.kind === "primary") };
+}
 
 /**
  * ── Loading captions ──────────────────────────────────────────────────────────
@@ -107,6 +117,7 @@ const LOAD_AGENT = [
   "Drafting something you can actually send",
 ];
 // Work-permit review is a safety-critical path: this set stays dry and factual.
+// (Dormant until feed.js emits intent: "review_permit" again — see AGENT_TITLES.)
 const LOAD_PERMIT = [
   "Reviewing this permit…",
   "Reading the permit and its conditions",
@@ -126,6 +137,14 @@ const LOAD_DRILL = [
 // One reserved line: the box keeps its height whichever caption is showing, so
 // rotation never nudges the content under it.
 const LOADER_LINE = { display: "block", minHeight: 20, lineHeight: "20px" };
+
+// The three modals (reject, quote, drill) share one scrim and one dialog shell,
+// differing only in width plus the drill's own size overrides.
+const SCRIM = { position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 };
+const dialogStyle = (width, extra) => ({
+  width, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14,
+  padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)", ...extra,
+});
 
 /**
  * Rotate a loading caption every `intervalMs` while `active`.
@@ -208,7 +227,7 @@ export default function App() {
           refreshImportant();
           await refreshCounts();
         }
-      } catch (e) { setAuthed(false); }
+      } catch { setAuthed(false); }
     })();
   }, []);
 
@@ -333,7 +352,7 @@ export default function App() {
       setCounts(r.buckets || []);
       setLastTick(r.ranAt || new Date().toISOString());
       return r.buckets || [];
-    } catch (e) { setLive(false); return stateRef.current.counts; }
+    } catch { setLive(false); return stateRef.current.counts; }
   }
   async function loadPage(b, p) {
     if (!b) return;
@@ -366,6 +385,13 @@ export default function App() {
     setComposerOpen(false);
   }
 
+  // Optimistic local removal: drop the card from the open page and decrement its
+  // queue badge. Each caller reconciles with the server right after.
+  function removeJobLocally(job) {
+    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+  }
+
   async function takeAction(job, action) {
     if (action.act === "open") { if (job.record_url) window.open(job.record_url, "_blank", "noopener"); return; }
     if (action.act === "quote") { setQuote({ job }); setQuoteAmount(""); return; }
@@ -381,15 +407,13 @@ export default function App() {
     setActingId(job.external_id);
     setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
     // optimistic: remove the card and drop the badge now
-    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+    removeJobLocally(job);
     try {
       const res = await vibe.executeFunction("feed", "act", { external_id: job.external_id, action_type: action.label, actor });
       if (res?.ok) {
         setResult({ id: job.external_id, status: "ok", text: `${action.label} · synced to Facilio` });
         flash(`${action.label} · ${job.ref} — synced to Facilio`);
-        await refreshCounts();
-        await loadPage(bucket, page);
+        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
       } else {
         setResult({ id: job.external_id, status: "err", text: res?.error || "unknown error" });
         flash(`Couldn't sync to Facilio: ${res?.error || "unknown error"}`);
@@ -460,8 +484,7 @@ export default function App() {
   async function closeAgent() {
     clearTimeout(agentTimer.current);
     setAgent(null);
-    await refreshCounts();
-    if (bucket) await loadPage(bucket, page);
+    await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : null]);
   }
 
   /**
@@ -488,10 +511,8 @@ export default function App() {
         const moved = res.after_state ? ` · now ${res.after_state}` : "";
         setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}${moved}` });
         flash(`${job.ref} — ${res.permit_status}${res.verified === false ? " (sent, but could not re-read the permit)" : ""}`);
-        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-        await refreshCounts();
-        if (bucket) await loadPage(bucket, page);
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : null]);
         return { ok: true };
       }
       const err = res?.error || "Could not complete that.";
@@ -536,9 +557,8 @@ export default function App() {
         flash(`Tenant quote created for ${job.ref}${res.quoteId ? " · #" + res.quoteId : ""}`);
         setResult({ id: job.external_id, status: "ok", text: `Tenant quote created${res.quoteId ? " · #" + res.quoteId : ""}` });
         setQuote(null);
-        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-        await refreshCounts(); await loadPage(bucket, page);
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
       } else {
         flash("Couldn't create quote: " + (res?.error || "unknown error"));
       }
@@ -576,9 +596,8 @@ export default function App() {
       if (res?.ok) {
         flash(`${job.ref} — ${res.updated} line${res.updated === 1 ? "" : "s"} updated`);
         setDrill(null);
-        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-        await refreshCounts(); await loadPage(bucket, page);
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
       } else { flash("Couldn't update PO: " + (res?.error || "error")); }
     } catch (e) { flash("Update failed: " + (e?.message || e)); }
     finally { setDrillBusy(false); }
@@ -586,9 +605,11 @@ export default function App() {
 
   function flash(m) { setToast(m); clearTimeout(window.__t); window.__t = setTimeout(() => setToast(null), 3000); }
 
-  const countByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = c.count)); return m; }, [counts]);
-  const labelByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = c.label)); return m; }, [counts]);
-  const signalByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = !!c.signal)); return m; }, [counts]);
+  const { countByBucket, labelByBucket, signalByBucket } = useMemo(() => {
+    const countByBucket = {}, labelByBucket = {}, signalByBucket = {};
+    counts.forEach((c) => { countByBucket[c.bucket] = c.count; labelByBucket[c.bucket] = c.label; signalByBucket[c.bucket] = !!c.signal; });
+    return { countByBucket, labelByBucket, signalByBucket };
+  }, [counts]);
   const visibleBuckets = BUCKET_ORDER.filter((b) => counts.some((c) => c.bucket === b) && (tab === "signals") === !!signalByBucket[b] && (countByBucket[b] || 0) > 0);
 
   // Keeps the selection honest as counts move and tabs switch.
@@ -623,7 +644,7 @@ export default function App() {
       e.preventDefault();
       const i = list.findIndex((r) => r.external_id === selected?.external_id);
       const next = isDown ? Math.min(list.length - 1, i + 1) : Math.max(0, i < 0 ? 0 : i - 1);
-      const target = list[i < 0 ? 0 : next];
+      const target = list[next];
       if (target) {
         pick(target);
         document.getElementById("row-" + target.external_id)?.scrollIntoView({ block: "nearest" });
@@ -830,8 +851,8 @@ export default function App() {
       </div>
 
       {reject && (
-        <div onClick={() => !rejectBusy && setReject(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 520, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+        <div onClick={() => !rejectBusy && setReject(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(520)}>
             <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 2 }}>Reject permit</div>
             <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 18 }}>{reject.job.ref} · {reject.job.title}</div>
             <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--ink-3)" }}>Reason for rejection</label>
@@ -854,8 +875,8 @@ export default function App() {
       )}
 
       {quote && (
-        <div onClick={() => !quoteBusy && setQuote(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 420, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+        <div onClick={() => !quoteBusy && setQuote(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(420)}>
             <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 2 }}>Create Tenant Quote</div>
             <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 18 }}>{quote.job.ref} · {quote.job.title}</div>
             <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--ink-3)" }}>Quoted amount</label>
@@ -876,8 +897,8 @@ export default function App() {
       )}
 
       {drill && (
-        <div onClick={() => !drillBusy && setDrill(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 780, maxWidth: "94vw", maxHeight: "88vh", overflow: "auto", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+        <div onClick={() => !drillBusy && setDrill(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(780, { maxWidth: "94vw", maxHeight: "88vh", overflow: "auto" })}>
             <div style={{ fontSize: 17, fontWeight: 600 }}>Referred order · {drill.job.ref}</div>
             <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 14 }}>Update each referred line's PO unit cost to match the invoice, or edit manually.</div>
             {!drillData && (
@@ -950,10 +971,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
   const [draft, setDraft] = useState("");
   const [rtState, setRtState] = useState(vibe.realtimeState);
   const scroller = useRef(null);
-  const age = ageInfo(job.created_time);
-  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
-  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
-  const primary = acts.find((a) => a.kind === "primary");
+  const { age, sev, acts, primary } = jobView(job);
   const others = acts.filter((a) => a !== primary);
   const busy = !!(agent && agent.busy);
   const isPermit = agent?.intent === "review_permit";
@@ -1154,12 +1172,7 @@ function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue,
   // carry no severity breakdown, so anything wider would be invented.
   const glance = useMemo(() => {
     const g = { critical: 0, warning: 0, info: 0 };
-    for (const it of (items || [])) {
-      const chips = (it.why || []).map((w, j) => (it.why_tones || [])[j] || guessTone(w));
-      const worst = worstTone(chips.concat(it.tone ? [it.tone] : []));
-      const s = { red: "critical", amber: "warning", purple: "info", blue: "info" }[worst] || "info";
-      g[s] += 1;
-    }
+    for (const it of (items || [])) g[importantSev(it)] += 1;
     return g;
   }, [items]);
 
@@ -1259,10 +1272,16 @@ function guessTone(reason) {
   return "red"; // everything left is a hazard label (Fire risk, Leak, Electrical, …)
 }
 
+// One severity for a ranked item, shared by the glance strip and each row so
+// the two can never disagree about how a record reads.
+function importantSev(it) {
+  const tones = (it.why || []).map((w, j) => (it.why_tones || [])[j] || guessTone(w));
+  return TONE_SEV[worstTone(tones.concat(it.tone ? [it.tone] : []))] || "info";
+}
+
 function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
   const chips = (it.why || []).map((w, j) => ({ text: w, tone: (it.why_tones || [])[j] || guessTone(w) }));
-  const worst = worstTone(chips.map((c) => c.tone).concat(it.tone ? [it.tone] : []));
-  const sev = TONE_SEV[worst] || "info";
+  const sev = importantSev(it);
   const caption = [it.site, it.tenant].filter(Boolean).join(" · ");
   return (
     <div
@@ -1309,10 +1328,7 @@ function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
    One card anatomy for every queue: accent bar, id + chips, title, meta, verb.
    ========================================================================== */
 function Card({ r, selected, acting, onPick, onAction }) {
-  const age = ageInfo(r.created_time);
-  const sev = r.tone ? sevOf(r.tone, r.priority) : (age.sev || "info");
-  const acts = (r.actions || []).filter((a) => a.act !== "open" || r.record_url);
-  const primary = acts.find((a) => a.kind === "primary");
+  const { age, sev, primary } = jobView(r);
   const chips = [];
   if (r.flag) chips.push({ text: r.flag, cls: "pill" });
   if (r.priority && r.priority !== "Normal") chips.push({ text: r.priority, cls: "pill" });
@@ -1402,10 +1418,10 @@ function Logo({ small }) {
 function fmt(iso) {
   if (!iso) return "—";
   try { return new Date(iso).toLocaleString(undefined, { hour: "2-digit", minute: "2-digit" }); }
-  catch (e) { return iso; }
+  catch { return iso; }
 }
 function fmtDateTime(iso) {
   if (!iso) return "—";
   try { return new Date(iso).toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }); }
-  catch (e) { return iso; }
+  catch { return iso; }
 }
