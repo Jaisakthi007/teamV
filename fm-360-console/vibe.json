@@ -1,0 +1,7 @@
+{
+  "name": "FM 360 Console",
+  "app": "fm-360-console",
+  "build": {
+    "publish": "dist"
+  }
+}
