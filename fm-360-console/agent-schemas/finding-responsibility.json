@@ -1,0 +1,10 @@
+{
+  "title": "FindingResponsibility",
+  "type": "object",
+  "properties": {
+    "actionBy": { "type": "string", "enum": ["Tenant", "FM", "Unclear"] },
+    "reason": { "type": "string", "description": "One short sentence explaining the classification." }
+  },
+  "required": ["actionBy", "reason"],
+  "additionalProperties": false
+}

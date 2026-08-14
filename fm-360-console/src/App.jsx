@@ -8,7 +8,7 @@ const AGENT_TOPIC = "srops";       // where agent_bridge publishes each turn's r
 const AGENT_TIMEOUT_MS = 660000;   // just past the run's 600s ceiling; a killed run never publishes
 const newRunId = () =>
   (globalThis.crypto?.randomUUID?.() ?? "run-" + Math.random().toString(36).slice(2) + Date.now().toString(36));
-const BUILD = "v11 · tenant quote dialog";
+const BUILD = "v17 · agent panel + referral/findings";
 
 const C = {
   bg: "#F7F9FC", card: "#FFFFFF", border: "#D8E3F1", ink: "#283648",
@@ -44,6 +44,10 @@ export default function App() {
   const [quoteAmount, setQuoteAmount] = useState("");
   const [quoteBusy, setQuoteBusy] = useState(false);
   const [agent, setAgent] = useState(null); // { job, threadId, turns[], busy }
+  const [drill, setDrill] = useState(null);       // { job }
+  const [drillData, setDrillData] = useState(null); // { po, lines, autoMatch }
+  const [drillEdits, setDrillEdits] = useState({}); // lineId -> new unit price (string)
+  const [drillBusy, setDrillBusy] = useState(false);
   const [toast, setToast] = useState(null);
   const [lastTick, setLastTick] = useState(null);
   const [live, setLive] = useState(true);
@@ -150,6 +154,19 @@ export default function App() {
     // team, not a one-shot write: the team performs the acknowledge and stays open
     // for the follow-on steps (work order, procurement, RFQ).
     if (action.act === "agent") { openAgent(job, action); return; }
+    if (action.act === "drill") { openDrill(job); return; }
+    if (action.act === "approve" || action.act === "reject") {
+      setActingId(job.external_id);
+      setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+      setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+      try {
+        const res = await vibe.executeFunction("feed", "permit_decision", { external_id: job.external_id, decision: action.act, actor });
+        if (res?.ok) { flash(`${job.ref} — ${res.permit_status}`); await refreshCounts(); await loadPage(bucket, page); }
+        else { flash(`Couldn't ${action.label.toLowerCase()}: ${res?.error || "error"}`); await loadPage(bucket, page); }
+      } catch (e) { flash(`${action.label} failed: ` + (e?.message || e)); await loadPage(bucket, page); }
+      finally { setActingId(null); }
+      return;
+    }
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     // optimistic: remove the card and drop the badge now
@@ -249,6 +266,44 @@ export default function App() {
       }
     } catch (e) { flash("Create quote failed: " + (e?.message || e)); }
     finally { setQuoteBusy(false); }
+  }
+
+  async function openDrill(job) {
+    setDrill({ job }); setDrillData(null); setDrillEdits({});
+    try {
+      const r = await vibe.executeFunction("feed", "po_reconcile_view", { external_id: job.external_id });
+      setDrillData(r);
+      const init = {};
+      (r.lines || []).forEach((l) => { init[l.lineId] = String(l.invoiceUnitPrice != null ? l.invoiceUnitPrice : l.poUnitPrice); });
+      setDrillEdits(init);
+    } catch (e) { flash("Couldn't load lines: " + (e?.message || e)); setDrill(null); }
+  }
+  function setAllToInvoice() {
+    setDrillEdits((prev) => {
+      const next = { ...prev };
+      (drillData?.lines || []).forEach((l) => { if (l.invoiceUnitPrice != null) next[l.lineId] = String(l.invoiceUnitPrice); });
+      return next;
+    });
+  }
+  async function applyReconcile() {
+    const lines = drillData?.lines || [];
+    const updates = lines
+      .map((l) => ({ lineId: l.lineId, unitPrice: Number(drillEdits[l.lineId]) }))
+      .filter((u) => u.lineId != null && !isNaN(u.unitPrice));
+    if (!updates.length) { flash("Nothing to update"); return; }
+    setDrillBusy(true);
+    const job = drill.job;
+    try {
+      const res = await vibe.executeFunction("feed", "po_reconcile_apply", { external_id: job.external_id, updates: JSON.stringify(updates), actor });
+      if (res?.ok) {
+        flash(`${job.ref} — ${res.updated} line${res.updated === 1 ? "" : "s"} updated`);
+        setDrill(null);
+        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+        await refreshCounts(); await loadPage(bucket, page);
+      } else { flash("Couldn't update PO: " + (res?.error || "error")); }
+    } catch (e) { flash("Update failed: " + (e?.message || e)); }
+    finally { setDrillBusy(false); }
   }
 
   function flash(m) { setToast(m); clearTimeout(window.__t); window.__t = setTimeout(() => setToast(null), 3000); }
@@ -369,6 +424,59 @@ export default function App() {
       )}
 
       {agent && <AgentPanel agent={agent} onSend={sendAgent} onClose={closeAgent} />}
+      {drill && (
+        <div onClick={() => !drillBusy && setDrill(null)} style={{ position: "fixed", inset: 0, background: "rgba(20,32,52,.45)", display: "grid", placeItems: "center", zIndex: 60 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 760, maxWidth: "94vw", maxHeight: "88vh", overflow: "auto", background: C.card, borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(0,0,0,.3)" }}>
+            <div style={{ fontSize: 17, fontWeight: 700 }}>Referred order · {drill.job.ref}</div>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 14 }}>Update each referred line's PO unit cost to match the invoice, or edit manually.</div>
+            {!drillData && <p style={{ color: C.muted }}>Loading lines…</p>}
+            {drillData && !drillData.lines.length && <p style={{ color: C.muted }}>No referred lines found on this order.</p>}
+            {drillData && drillData.lines.length > 0 && (
+              <>
+                {!drillData.autoMatch && (
+                  <div style={{ background: C.amberSoft, color: C.amber, border: `1px solid #F0D98A`, borderRadius: 8, padding: "8px 12px", fontSize: 12.5, marginBottom: 12 }}>
+                    Invoice matching isn't wired yet (the invoice line's PO-line-number field name is pending) — invoice prices show as “—”; you can still edit costs manually.
+                  </div>
+                )}
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ textAlign: "left", color: C.muted, borderBottom: `1px solid ${C.border}` }}>
+                      <th style={{ padding: "8px 6px" }}>Line</th>
+                      <th style={{ padding: "8px 6px" }}>Description</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>Qty</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>PO unit price</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>Invoice unit price</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>New PO cost</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {drillData.lines.map((l) => (
+                      <tr key={l.lineId} style={{ borderBottom: `1px solid ${C.border}` }}>
+                        <td style={{ padding: "8px 6px" }}>{l.lineNo}</td>
+                        <td style={{ padding: "8px 6px" }}>{l.description || "—"}</td>
+                        <td style={{ padding: "8px 6px", textAlign: "right" }}>{l.quantity}</td>
+                        <td style={{ padding: "8px 6px", textAlign: "right" }}>{l.poUnitPrice}</td>
+                        <td style={{ padding: "8px 6px", textAlign: "right", color: l.invoiceUnitPrice != null && Number(l.invoiceUnitPrice) !== Number(l.poUnitPrice) ? C.red : C.ink }}>{l.invoiceUnitPrice != null ? l.invoiceUnitPrice : "—"}</td>
+                        <td style={{ padding: "6px", textAlign: "right" }}>
+                          <input type="number" min="0" step="0.01" value={drillEdits[l.lineId] ?? ""} onChange={(e) => setDrillEdits((p) => ({ ...p, [l.lineId]: e.target.value }))}
+                            style={{ width: 100, padding: "6px 8px", fontSize: 13, textAlign: "right", border: `1px solid ${C.border}`, borderRadius: 6 }} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginTop: 18 }}>
+                  <button style={{ ...btn(false), opacity: drillData.autoMatch ? 1 : 0.5 }} disabled={!drillData.autoMatch || drillBusy} onClick={setAllToInvoice}>Set all to invoice cost</button>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button style={btn(false)} disabled={drillBusy} onClick={() => setDrill(null)}>Cancel</button>
+                    <button style={{ ...btn(true), opacity: drillBusy ? 0.6 : 1 }} disabled={drillBusy} onClick={applyReconcile}>{drillBusy ? "Updating…" : "Apply & Update PO"}</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {toast && <div style={{ position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", background: C.ink, color: "#fff", padding: "11px 18px", borderRadius: 10, fontSize: 13.5, boxShadow: "0 6px 24px rgba(0,0,0,.22)", zIndex: 50 }}>{toast}</div>}
     </div>
@@ -508,6 +616,7 @@ function Card({ r, acting, onAction }) {
         </div>
         <div style={{ fontSize: 15.5, fontWeight: 600, marginBottom: 5, lineHeight: 1.3, color: C.ink }}>{r.title}</div>
         {line && <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.45, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{line}</div>}
+        {r.valid_from && <div style={{ fontSize: 12.5, color: C.muted, marginTop: 3 }}>Valid {fmtDateTime(r.valid_from)} → {fmtDateTime(r.valid_to)}</div>}
         {r.ai_note && (
           <div style={{ marginTop: 8, background: C.purpleSoft, border: `1px solid #E4DBFF`, borderRadius: 8, padding: "8px 10px", fontSize: 12.5, color: "#3D2A86", lineHeight: 1.5 }}>
             <strong style={{ color: C.purple }}>AI</strong> &nbsp;{r.ai_note}
@@ -518,8 +627,8 @@ function Card({ r, acting, onAction }) {
         <span style={{ fontSize: 12.5, fontWeight: 600, color: age.color, whiteSpace: "nowrap" }}>{age.label}</span>
         <div style={{ display: "flex", gap: 8 }}>
           {(r.actions || []).map((a, i) => (
-            <button key={i} disabled={acting && a.kind === "primary"} onClick={() => onAction(a)}
-              style={{ ...btn(a.kind === "primary"), padding: "8px 16px", opacity: acting && a.kind === "primary" ? 0.6 : 1, whiteSpace: "nowrap" }}>
+            <button key={i} disabled={acting} onClick={() => onAction(a)}
+              style={{ ...btn(a.kind === "primary"), padding: "8px 16px", opacity: acting ? 0.6 : 1, whiteSpace: "nowrap" }}>
               {acting && a.kind === "primary" ? "…" : a.label}
             </button>
           ))}
