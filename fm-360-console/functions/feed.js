@@ -106,7 +106,9 @@ function withView(actions, url) {
 }
 
 const BUCKET_LABELS = {
-  tsr: "TSR's to acknowledge", tsrack: "Acknowledged TSRs", unblock: "Unblock vendors",
+  // One queue, both states. Named for the RECORD rather than for a step in the
+  // flow ("...to acknowledge" would be a lie about half the rows in it now).
+  tsr: "Tenant service requests", unblock: "Unblock vendors",
   referral: "Orders awaiting referral", completion: "Orders awaiting completion",
   findings: "Open findings", stalled: "Stalled work orders", quotes: "Vendor comments",
   spot: "Spot checks", tenant: "Tenant dissatisfaction", sla: "SLA breaches by vendor",
@@ -114,14 +116,86 @@ const BUCKET_LABELS = {
 };
 
 // ============================================================================
-// Referred Orders assumptions — VERIFY/FILL once PO + invoice data exists in the org.
-// (org 2931 currently has 0 purchase orders, so these field/status names are from
-//  the schemas, not from live records.)
-const REFERRED_PO_STATE = "Referred";              // PO moduleState value for referred orders
-const LINE_REFERRED_STATUS = "Referred";           // per-line Facilio status to include in the drill-down
-const PO_LINE_NUMBER_FIELDS = ["lineNumber", "referenceId", "localId"]; // first present = the PO line's number
-// The invoice line's field that carries the PO line number (a CUSTOM field — set its API name here):
-const INVOICE_LINE_PO_LINE_FIELD = ""; // e.g. "po_line_number_invoiceLineItem" — empty = auto-match disabled
+// Referred Orders — VERIFIED against org 2931 (Team V, US) on 2026-08-14.
+//
+// DIRECTION OF THE UPDATE: the PO line is corrected to the invoice cost
+// (PO line <- invoice). This is not an interpretation of the prose — it is what
+// the org actually supports. The ONLY write action that touches a line price is
+// `cbre-clone.update-purchase-order`, whose own contract reads "Correct one OR
+// MORE purchase order line items' amounts so they match the related MRI
+// invoice ... the corrected amount taken from the invoice." There is no action
+// anywhere in this org that updates an invoice line. The schema agrees: the
+// split-line module below carries `unit_cost` (the PO's own) next to
+// `mri_unit_cost` (the value that arrives from MRI/invoicing) — the MRI number
+// is the source, the PO number is the target.
+//
+// PO-level "Referred" — org 2931 has TWO independent notions, and only the
+// second one is populated:
+//   1. moduleState. The purchaseorder state flow DOES define a `referred` state
+//      (id 153879, status string "referred", displayName "Referred"), but 0 of
+//      the org's 1247 POs sit in it — every single one is `draft`.
+//   2. po_mri_status_purchaseorder ("MRI Status", ENUM). Its "Referred" option
+//      (enum id 6) is set on 12 POs. This is the real signal today.
+// We accept EITHER so the bucket keeps working if the state flow starts being
+// driven. NOTE list-purchase-orders returns moduleState as the LOWERCASE status
+// string ("draft"), never the displayName — the previous `=== "Referred"`
+// comparison could never have matched, so the comparison here is lowercased.
+const REFERRED_PO_STATE = "referred";              // moduleState.status (lowercase); state id 153879
+const PO_MRI_STATUS_FIELD = "po_mri_status_purchaseorder";
+const REFERRED_PO_MRI_STATUS = "Referred";         // po_mri_status_purchaseorder enum label (id 6)
+// list-purchase-orders drops custom fields from its default projection, so every
+// custom field we rely on must be named in `select`; `expand` is only honoured
+// for lookups that also appear in `select` (verified — omitting `vendor` from
+// select silently drops the expansion).
+const PO_SELECT = "id,name,description,moduleState,localId,vendor,subTotal,totalCost," +
+  PO_MRI_STATUS_FIELD + ",sysCreatedTime,sysModifiedTime";
+
+// Per-line "Facilio status = Referred". The built-in `purchaseorderlineitems`
+// module has NO status field whatsoever — its 17 fields are all built-in (cost,
+// description, inventoryType, itemType, purchaseOrder, quantity,
+// quantityReceived, quantityStocked, referenceId, service, sysModifiedBy,
+// sysModifiedTime, tax, taxAmount, toolType, unitOfMeasure, unitPrice). The
+// line-level status the requirement describes lives on the CUSTOM module
+// `custom_polineitemssplit` ("Line Items Building Split"), field
+// `facilio_status_custom_polineitemssplit` — display name literally "Facilio
+// Status" — whose "Referred" option is enum id 4. That module also carries BOTH
+// numbers we need side by side, so when split rows exist no invoice cross-join
+// is needed at all. It currently holds 0 records, so the built-in lineItems
+// path below is what actually runs today.
+const SPLIT_MODULE = "custom_polineitemssplit";
+const SPLIT_STATUS_FIELD = "facilio_status_custom_polineitemssplit";
+const SPLIT_REFERRED = "Referred";                              // enum id 4
+const SPLIT_PO_FIELD = "purchase_order_custom_polineitemssplit"; // LOOKUP -> purchaseorder
+const SPLIT_UNIT_COST = "unit_cost_custom_polineitemssplit";     // the PO line's own unit cost
+const SPLIT_MRI_UNIT_COST = "mri_unit_cost_custom_polineitemssplit"; // the invoice/MRI unit cost
+const SPLIT_LINE_NO = "linenumber";
+const SPLIT_SELECT = "id,name," + SPLIT_LINE_NO + "," + SPLIT_STATUS_FIELD + "," + SPLIT_PO_FIELD +
+  "," + SPLIT_UNIT_COST + "," + SPLIT_MRI_UNIT_COST + ",quantity_custom_polineitemssplit," +
+  "mri_line_status_custom_polineitemssplit,po_line_number_custom_polineitemssplit";
+
+// The PO line's number. `purchaseorderlineitems` has no line-number field at
+// all; `referenceId` (STRING) is the only line-level identifier, and it is null
+// on every record sampled. So this degrades to the 1-based position, which is
+// exactly what the CBRE invoice descriptions call "PO Line N".
+const PO_LINE_NUMBER_FIELDS = ["referenceId"];
+
+// The invoice line's field that carries the PO line number. THE CUSTOM FIELD THE
+// REQUIREMENT ASSUMES DOES NOT EXIST: `invoicelineitems` has 19 fields and every
+// one of them is built-in (isCustom=false) — contractService, cost,
+// costWithMarkup, description, invoice, itemType, labour, markup, quantity,
+// rawData, referenceId, service, tax, taxAmount, toolType, type, unitOfMeasure,
+// unitPrice, unitPriceWithMarkup. The only shared line-level key is the built-in
+// STRING `referenceId`, which exists on BOTH invoicelineitems and
+// purchaseorderlineitems and is the correct join key — but it is null on every
+// invoice line in the org today. `invoice.ponumber` (custom STRING "PO Number")
+// exists at the invoice HEADER, not the line, and is null on all 55 invoices.
+// What IS populated at line level is a text encoding the CBRE import stamps into
+// the invoice line description, e.g.
+//     "CBRE MRI PO8001531_220501 - order total | PO Line 1 (PO line item id 81581)"
+// so referenceId is tier 1 and that description parse is tier 2. Nothing else is
+// used: an unmatched line stays unmatched rather than being guessed by position.
+const INVOICE_LINE_PO_LINE_FIELD = "referenceId";
+const INVOICE_SELECT = "id,localId,invoiceNumber,subject,purchaseOrder,ponumber,mriinvoicekey,totalCost,invoiceStatus";
 // ============================================================================
 
 // ============================================================================
@@ -145,6 +219,225 @@ function findingTone(priority) {
   if (p.indexOf("medium") >= 0 || p.indexOf("moderate") >= 0) return "#FFD405";
   if (p.indexOf("low") >= 0) return "#0059D6";
   return "";
+}
+// ============================================================================
+
+// ============================================================================
+// STALLED WORK ORDERS — the design's subtitle defines it: "No PI or order
+// raised". An open work order with no Procurement Initiation and no Purchase
+// Order behind it is a job nobody is buying anything for.
+//
+// HOW THE LINK IS ACTUALLY MODELLED IN THIS ORG (verified 2026-08-14, org 2931)
+//   • PI → WO   custom_procurementinitiation.workorder_custom_procurementinitiation
+//               LOOKUP → workorder.  POPULATED: 21 PI records, 15 of which carry
+//               a work-order id (6 distinct work orders).  This is the only
+//               direction that actually holds data, so "has a PI?" must be
+//               answered by scanning procurement initiations and inverting the
+//               reference — it cannot be read off the work order.
+//   • WO → PI   workorder.associated_procurement_activity_workorder exists in the
+//               schema but is EMPTY on all 283 work orders (confirmed both by
+//               projection and by the server-side filter
+//               `associated_procurement_activity_workorder(is_empty)=true`,
+//               which returns the full 283).
+//   • PO → WO   purchaseorder.associated_work_order_purchaseorder exists in the
+//               schema but is EMPTY on all 1,247 purchase orders, as is
+//               associated_procurement_activity_purchaseorder. The PO set in
+//               this org is an orphaned import: 368 of them name a work order in
+//               their title ("Purchase Order for WO#14668") referencing numbers
+//               8832–41574, none of which is a work-order id or serialNumber
+//               that exists here. So NO purchase order is attached to any work
+//               order by any route today.
+//   • WO → PO   workorder.purchase_order_workorder / po_id_workorder /
+//               restrict_work_order_cancellation_workorder ("PO Created?") are
+//               likewise empty on all 283.
+//
+// CONSEQUENCE, STATED PLAINLY: the "no order raised" half of this predicate
+// excludes NOTHING today — every work order in the org trivially satisfies it.
+// Only the PI half discriminates, and it removes just 6 records. The bucket is
+// therefore large (277 of 283) rather than empty. The scans below are still
+// written the correct way round so the bucket tightens by itself the moment
+// real PO↔WO links exist; nothing here needs changing when they do.
+//
+// Work orders carry no `localId` (that field does not exist on the module) —
+// the human-facing number is `serialNumber`, and the modified-time field is
+// `modifiedTime`, not `sysModifiedTime`.
+//
+// State ids: the connections filter validates moduleState against the status
+// STRING and rejects the numeric id outright ("Invalid value '184483' for field
+// 'moduleState'"), so the criteria below must be status names. Ids are recorded
+// in the comment for traceability.
+//
+// Open = live jobs only. Facilio reports Resolved/Closed/Cancelled as type OPEN
+// on this module, so the terminal states have to be excluded by name rather than
+// by type; PRE_OPEN states (Requested/Rejected/Scheduled/…) are excluded too, as
+// no procurement is expected before a work order is actually opened.
+const WO_OPEN_STATES = [
+  "pendingsocreation",    // 153893 Pending SO Activation
+  "inspectioncompleted",  // 153898 Inspection Completed
+  "Submitted",            // 184482 Created
+  "Assigned",             // 184483
+  "Work in Progress",     // 184484
+  "Incomplete",           // 184485
+  "Yet to Start",         // 184491
+  "In Progress",          // 184492
+  "On Hold",              // 184493 Work On Hold
+  "Re-Opened",            // 184498
+];
+// Excluded terminal: Resolved 184494, Closed 184495, Cancelled 184496, Skipped 184497.
+// Excluded PRE_OPEN: preopen 184486, Requested 184487, Rejected 184488,
+//                    Processing 184489, Scheduled 184490.
+
+// A cancelled or rejected procurement is not a procurement — the job is stuck
+// again — so those PIs do not clear a work order out of this bucket.
+const PI_DEAD_STATES = ["procurementcancelled", "rejected", "close"];
+
+// Purchase orders can only be scanned by paging (list-purchase-orders IGNORES
+// `filters`: moduleState=poapproved still returns the full 1,247), so the sweep
+// is bounded. 7 pages covers the current 1,247 with room to grow.
+const STALLED_PO_SCAN_PAGES = 8;
+
+/* ---- PURE-STALLED-START — extracted verbatim and exercised by the offline
+   verifier against real Facilio payloads; keep this block free of I/O. ---- */
+function stalledStateIsOpen(wo) {
+  return WO_OPEN_STATES.indexOf(String(nameOf(wo.moduleState) || wo.moduleState || "")) >= 0;
+}
+function lookupId(v) {
+  if (v == null) return null;
+  const id = typeof v === "object" ? v.id : v;
+  const n = Number(id);
+  return n ? n : null;
+}
+// Work orders that a live procurement initiation points at.
+function procuredWorkOrderIds(piRecords) {
+  const ids = new Set();
+  for (const p of piRecords || []) {
+    if (PI_DEAD_STATES.indexOf(String(nameOf(p.moduleState) || p.moduleState || "")) >= 0) continue;
+    const id = lookupId(p.workorder_custom_procurementinitiation);
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+// Work orders that a purchase order points at.
+function orderedWorkOrderIds(poRecords) {
+  const ids = new Set();
+  for (const p of poRecords || []) {
+    const id = lookupId(p.associated_work_order_purchaseorder);
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+// The bucket's qualifying test. `piWoIds` / `poWoIds` are the Sets above.
+function workOrderIsStalled(wo, piWoIds, poWoIds) {
+  if (!stalledStateIsOpen(wo)) return false;
+  const id = Number(wo.id);
+  if (piWoIds && piWoIds.has(id)) return false;                        // procurement initiated
+  if (poWoIds && poWoIds.has(id)) return false;                        // a PO points here
+  if (lookupId(wo.associated_procurement_activity_workorder)) return false;
+  if (lookupId(wo.purchase_order_workorder)) return false;
+  if (wo.po_id_workorder) return false;
+  if (wo.restrict_work_order_cancellation_workorder === true) return false; // "PO Created?"
+  return true;
+}
+/* ---- PURE-STALLED-END ---- */
+
+// ============================================================================
+// SPOT CHECKS
+// A work assignment the vendor is actively working, where that SAME vendor has
+// had OTHER work reopened — grounds for the FM to spot-check the job in flight.
+//
+// Reference implementation is the work order module's "Initiate Spot Check"
+// custom button (id 3380565, buttonType `customButton`, active, restricted to
+// 7 FM roles), whose live criteria read verbatim:
+//     ( work_assignment_type_workorder = 2                       // Work Execution
+//       AND moduleState NOT IN (184495, 153893, 184496)          // Closed / Pending SO Activation / Cancelled
+//       AND inspection_workorder IS NULL                         // no spot check triggered yet
+//       AND type != 517 )
+// It fires workflow action 5889906 ("Initiate Spot Check_WORKFLOW_ACTION_Action").
+// NOTE the button gates on `work_assignment_type_workorder = Work Execution`,
+// NOT on `work_classification_workorder`; the criteria below follow the stated
+// requirement (Work Classification = Work Assignment), which in this org selects
+// the same 17 records — every Work Assignment is also a Work Execution.
+//
+// Field names verified against workorder metadata:
+//   work_classification_workorder   ENUM  "Work Order" | "Work Assignment"
+//   reason_for_reopening_workorder  LARGE_TEXT (max 2000) — the reopen reason
+//   vendor                          LOOKUP -> vendors
+//   inspection_workorder            LOOKUP -> inspectionResponse (set once checked)
+//   spot_check_initiated__workorder BOOLEAN
+//
+// State ids for reference: Work in Progress 184484, In Progress 184492.
+// `filters` DOES work on list-work-orders (unlike list-purchase-orders /
+// list-quotes), so the classification predicate is pushed server-side — but
+// `reason_for_reopening_workorder(is_not_empty)` makes the backend throw
+// ("Unknown column 'WorkOrders.null' in 'where clause'"), and the vendor test is
+// a cross-record join anyway, so both are computed here over one fetched page.
+const SPOT_WORK_CLASSIFICATION = "Work Assignment";
+const SPOT_INPROGRESS_STATES = ["Work in Progress", "In Progress"];
+
+/* ---- PURE-SPOT-START — no I/O; exercised by the offline verifier against real
+   Facilio payloads. ---- */
+function spotIsWorkAssignment(wo) {
+  return String(wo.work_classification_workorder || "") === SPOT_WORK_CLASSIFICATION;
+}
+function spotIsInProgress(wo) {
+  return SPOT_INPROGRESS_STATES.indexOf(String(nameOf(wo.moduleState) || wo.moduleState || "")) >= 0;
+}
+function spotReopenReason(wo) {
+  return String(wo.reason_for_reopening_workorder == null ? "" : wo.reason_for_reopening_workorder).trim();
+}
+// A spot check already exists on this record, so it needs no further action.
+function spotAlreadyChecked(wo) {
+  return wo.spot_check_initiated__workorder === true || !!lookupId(wo.inspection_workorder);
+}
+// vendorId -> array of the vendor's work assignments that carry a reopen reason.
+// Only work assignments count as evidence, matching the stated criteria.
+function spotReopenedByVendor(waRecords) {
+  const m = new Map();
+  for (const w of waRecords || []) {
+    if (!spotIsWorkAssignment(w)) continue;
+    if (!spotReopenReason(w)) continue;
+    const v = lookupId(w.vendor);
+    if (!v) continue;                       // no vendor = no vendor-level evidence
+    if (!m.has(v)) m.set(v, []);
+    m.get(v).push(w);
+  }
+  return m;
+}
+// The bucket's qualifying test. Returns null when the record does not qualify,
+// otherwise the record plus the evidence that flagged it — so the card can state
+// the real reason and never an invented one.
+function spotCheckCandidate(wo, reopenedByVendor) {
+  if (!spotIsWorkAssignment(wo)) return null;
+  if (!spotIsInProgress(wo)) return null;
+  if (spotAlreadyChecked(wo)) return null;
+  const vendorId = lookupId(wo.vendor);
+  if (!vendorId) return null;
+  const evidence = (reopenedByVendor && reopenedByVendor.get(vendorId)) || [];
+  // "some OTHER work assignment" — the record cannot be its own evidence.
+  const others = evidence.filter((e) => Number(e.id) !== Number(wo.id));
+  if (!others.length) return null;
+  return { wo, vendorId, reopened: others };
+}
+function qualifyingSpotChecks(waRecords) {
+  const reopenedByVendor = spotReopenedByVendor(waRecords);
+  const out = [];
+  for (const w of waRecords || []) {
+    const c = spotCheckCandidate(w, reopenedByVendor);
+    if (c) out.push(c);
+  }
+  return out;
+}
+/* ---- PURE-SPOT-END ---- */
+// ============================================================================
+
+function ageLabelFrom(t) {
+  if (!t) return "";
+  const ms = Date.now() - new Date(t).getTime();
+  if (isNaN(ms) || ms < 0) return "";
+  const h = Math.floor(ms / 3600000);
+  if (h < 1) return "new";
+  if (h < 24) return h + "h old";
+  return Math.floor(h / 24) + "d old";
 }
 // ============================================================================
 
@@ -221,6 +514,61 @@ function signalBucketDef(id) {
   };
 }
 
+// ---- work-permit evidence tag ----------------------------------------------
+// The "Unblock vendors" cards carry a suggestion computed from the permit's own
+// checklist rather than from an LLM. That is a deliberate call, not a shortcut:
+// across the live queue the pre-work checklists collapse to two distinct
+// contents — 50 Electrical permits whose three items carry byte-identical canned
+// notes, and one Hot Work permit (PMT-319) with 27 blank items. An LLM asked to
+// judge those would return the same sentence 50 times and one other; the reading
+// that actually separates the queue ("is there evidence here at all?") is a count,
+// and a count cannot hallucinate. The Studio reviewer agent still exists for the
+// deep read — it is just no longer a per-card button.
+
+// The connections endpoint hands this action back flat, but tolerate the
+// {data:{...}} envelope the list actions use so a gateway change can't blank the tag.
+function unwrapChecklist(resp) {
+  if (!resp || typeof resp !== "object") return null;
+  if (resp.pre_work_checklist || resp.pre_work_items_total != null) return resp;
+  if (resp.data && typeof resp.data === "object") return resp.data;
+  return resp;
+}
+
+// Pure: checklist payload -> { flag, tone, ai_note } | null. Only ever reports
+// what was counted. Nothing here can say a permit is safe to approve — a full
+// set of notes is reported as "evidenced", which is a statement about the
+// paperwork, not a recommendation.
+function permitEvidence(c) {
+  if (!c || typeof c !== "object") return null;
+  // A payload carrying neither of these is not a checklist read (a gateway error
+  // body, a shape change). Untagged beats a red badge invented from nothing.
+  if (!Array.isArray(c.pre_work_checklist) && !Number.isFinite(c.pre_work_items_total)) return null;
+  const pre = Array.isArray(c.pre_work_checklist) ? c.pre_work_checklist : [];
+  const total = Number.isFinite(c.pre_work_items_total) ? c.pre_work_items_total : pre.length;
+  if (!total) {
+    return { flag: "No pre-work checklist", tone: "#B61919",
+      ai_note: "This permit type has no pre-work checklist items — there is nothing recorded to verify before approval." };
+  }
+  const blank = Number.isFinite(c.pre_work_items_with_no_notes)
+    ? c.pre_work_items_with_no_notes
+    : pre.filter((i) => !String(i.notes_written_by_the_person_who_filled_it_in || "").trim()).length;
+  const filled = Math.max(0, total - blank);
+  const signed = pre.filter((i) => i.already_signed_off_by_a_reviewer).length;
+  const files = pre.reduce((n, i) => n + (Number(i.evidence_files_attached) || 0), 0);
+  const eviNote = files ? files + " evidence file" + (files === 1 ? "" : "s") + " attached" : "no evidence files attached";
+
+  if (filled === 0) {
+    return { flag: "No checklist evidence", tone: "#B61919",
+      ai_note: "None of the " + total + " pre-work checks carry notes — there is no evidence on this permit to review." };
+  }
+  if (filled < total) {
+    return { flag: filled + "/" + total + " checks evidenced", tone: "#FFD405",
+      ai_note: blank + " of " + total + " pre-work checks have no notes; " + signed + " signed off, " + eviNote + "." };
+  }
+  return { flag: total + "/" + total + " checks evidenced", tone: "#0059D6",
+    ai_note: "All " + total + " pre-work checks have notes (" + signed + " signed off) — notes only, " + eviNote + "." };
+}
+
 // ============================================================================
 // LIVE BUCKET QUERIES
 // Each bucket is a LIVE query against Facilio — module + criteria evaluated at
@@ -228,53 +576,39 @@ function signalBucketDef(id) {
 // the FM's action changes the source record so it leaves this criteria and
 // drops off the feed. Add a bucket here as you give me its module + criteria.
 // ============================================================================
+
+// The two states a tenant service request passes through while it is still the
+// FM's to move: "Open" = submitted, waiting to be acknowledged; "tsrvalidated" =
+// acknowledged, waiting for the work order (or the tenant quote). A request that
+// has left both has left this queue.
+const TSR_STATE_NEW = "Open";
+const TSR_STATE_ACK = "tsrvalidated";
+const TSR_STATES = [TSR_STATE_NEW, TSR_STATE_ACK];
+
 const BUCKETS = {
+  // ONE queue for the whole tenant service request, not one per state. The FM used
+  // to acknowledge in "TSR's to acknowledge", then hunt the same record down again
+  // in "Acknowledged TSRs" to raise its work order; the two buckets were a seam in
+  // the tool, never a seam in the job. Both states are read in a SINGLE server-side
+  // call and each row picks its own button from the state it is actually in.
   tsr: {
     label: BUCKET_LABELS.tsr,
     connection: "facilio-cmms",
     action: "list-service-requests",
     modifiedField: "sysModifiedTime",
-    filters: "moduleState=Open",              // status = submitted / to be acknowledged
+    // Comma-separated values on one field are an IN/OR on this action — VERIFIED
+    // against org 2931: moduleState=Open counts 136, moduleState=tsrvalidated 19,
+    // and moduleState=Open,tsrvalidated 155 (= 136 + 19, against 158 for the whole
+    // module). So no client-side merge is needed, `include_count` stays honest and
+    // paging stays server-side, sorted by sysModifiedTime across both states.
+    filters: "moduleState=" + TSR_STATES.join(","),
+    // Rows actioned while the queues were still split were recorded under the old
+    // `tsrack:` external_id. Without this they would come back from the dead in the
+    // merged bucket, so those ids are normalised onto `tsr:` when hiding.
+    aliases: ["tsrack"],
     expand: "siteId,tenant,tenant_serviceRequest_1",
-    select: "id,localId,subject,issue_location_serviceRequest,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime,sysModifiedTime",
-    module: "servicerequest",
-    signal: false,
-    toRow(r) {
-      const id = r.id;
-      const lid = r.localId && r.localId !== 0 ? r.localId : null;
-      const site = nameOf(r.siteId);
-      const issue = r.issue_location_serviceRequest || "";
-      const location = [site, issue].filter(Boolean).join(" · ");
-      const tenant = nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant);
-      const meta = [location || null, tenant ? "Tenant: " + tenant : null].filter(Boolean).join(" · ");
-      return {
-        external_id: "tsr:servicerequest:" + id, ref: "TSR-" + (lid || id),
-        bucket: "tsr", bucket_label: BUCKET_LABELS.tsr, source_module: "servicerequest",
-        title: r.subject || "(no subject)", priority: "Normal", tone: "", flag: "",
-        meta, ai_note: "", age_label: "", status: "Submitted",
-        site: location, tenant, requested_by: "",
-        local_id: lid ? String(lid) : "",
-        created_time: r.sysCreatedTime || "",
-        record_url: recordUrl("serviceRequest", id),
-        system_modified_time: r.sysModifiedTime || "",
-        // Acknowledge hands the record to the Service Request Operations team in
-        // the console's agent panel, which performs the acknowledge and stays open
-        // for the follow-on steps (work order, procurement, RFQ).
-        actions: withView(
-          [{ label: "Acknowledge", kind: "primary", act: "agent", prompt: "Acknowledge this tenant service request." }],
-          recordUrl("serviceRequest", id)
-        ),
-      };
-    },
-  },
-  tsrack: {
-    label: BUCKET_LABELS.tsrack,
-    connection: "facilio-cmms",
-    action: "list-service-requests",
-    modifiedField: "sysModifiedTime",
-    filters: "moduleState=tsrvalidated",       // status = Acknowledged
-    expand: "siteId,tenant,tenant_serviceRequest_1",
-    select: "id,localId,subject,issue_location_serviceRequest,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime,sysModifiedTime,tenant_rechargeable__serviceRequest,tenant_quote_path_serviceRequest",
+    // moduleState is in the projection now — it is what each row branches on.
+    select: "id,localId,subject,moduleState,issue_location_serviceRequest,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime,sysModifiedTime,tenant_rechargeable__serviceRequest,tenant_quote_path_serviceRequest",
     module: "servicerequest",
     signal: false,
     toRow(r) {
@@ -286,24 +620,50 @@ const BUCKETS = {
       const tenant = nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant);
       const rechargeable = r.tenant_rechargeable__serviceRequest === true;
       const qp = r.tenant_quote_path_serviceRequest || "";
+      // list-service-requests returns moduleState as the bare status string once it
+      // is named in `select` ("Open" / "tsrvalidated") — verified on a live page.
+      const state = String(nameOf(r.moduleState) || r.moduleState || "");
+      const acknowledged = state === TSR_STATE_ACK;
       const meta = [location || null, tenant ? "Tenant: " + tenant : null, qp ? "Quote path: " + qp : null].filter(Boolean).join(" · ");
-
-      // Buttons depend on the tenant quote path. Create Work Order hands the record
-      // to the Service Request Operations team in the agent panel (intent-based
-      // opening), which raises the WO and stays open for procurement + RFQ.
-      const woAction = { label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order", prompt: "Raise the work order for this request." };
       const url = recordUrl("serviceRequest", id);
+
+      // The button is the record's own next step, so a merged queue never asks the
+      // FM to work out which half of the flow a row is in:
+      //   • not yet acknowledged → the whole flow in one conversation. The
+      //     `tsr_flow` intent acknowledges (on the FM's explicit confirmation) and
+      //     then carries straight on to the work order in the SAME chat, instead of
+      //     ending the turn and making the FM come back for the second button.
+      //   • acknowledged, in-house CBRE quote → the local amount dialog, exactly as
+      //     before. This one deliberately does NOT go to the agent.
+      //   • acknowledged, any other quote path → the work order alone.
       let actions = [];
-      if (qp === "Provide In-House CBRE Quote") actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
-      else actions.push(woAction);
+      if (!acknowledged) {
+        actions.push({
+          label: "Acknowledge & proceed", kind: "primary", act: "agent", intent: "tsr_flow",
+          prompt: "Acknowledge this tenant service request, then raise the work order for it.",
+        });
+      } else if (qp === "Provide In-House CBRE Quote") {
+        actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
+      } else {
+        actions.push({ label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order", prompt: "Raise the work order for this request." });
+      }
       actions = withView(actions, url);
 
       return {
-        external_id: "tsrack:servicerequest:" + id, ref: "TSR-" + (lid || id),
-        bucket: "tsrack", bucket_label: BUCKET_LABELS.tsrack, source_module: "servicerequest",
-        title: r.subject || "(no subject)", priority: "Normal", tone: "#FFD405",
-        flag: rechargeable ? "Chargeable to tenant" : "",
-        meta, ai_note: "", age_label: "", status: "Acknowledged",
+        external_id: "tsr:servicerequest:" + id, ref: "TSR-" + (lid || id),
+        bucket: "tsr", bucket_label: BUCKET_LABELS.tsr, source_module: "servicerequest",
+        title: r.subject || "(no subject)", priority: "Normal",
+        // Acknowledged rows keep their amber tone; unacknowledged ones stay
+        // untinted and take the card's age colour, so the two halves of the merged
+        // queue are still distinguishable at a glance before you read a word.
+        tone: acknowledged ? "#FFD405" : "",
+        // The state is the FIRST pill, because in a merged list it is the thing the
+        // FM has to know before anything else. "Chargeable to tenant" keeps its own
+        // pill beside it rather than being displaced by the state.
+        flag: acknowledged ? "Acknowledged" : "To acknowledge",
+        flag2: rechargeable ? "Chargeable to tenant" : "",
+        meta, ai_note: "", age_label: "",
+        status: acknowledged ? "Acknowledged" : "Submitted",
         site: location, tenant, requested_by: "",
         local_id: lid ? String(lid) : "",
         created_time: r.sysCreatedTime || "",
@@ -348,13 +708,9 @@ const BUCKETS = {
           valid_from: iso(r.expectedStartTime), valid_to: iso(r.expectedEndTime),
           record_url: recordUrl("workpermit", id),
           system_modified_time: iso(r.sysModifiedTime),
-          // Review with AI opens the console's agent panel on the standalone
-          // Review Work Permits Studio agent (evidence first, decision only on the
-          // reviewer's explicit instruction in that chat). Approve/Reject stay as
-          // direct secondary actions — the agent path is additive, not a gate.
+          permit_id: id,   // enrichPage needs the raw record id for the checklist read
           actions: withView(
             [
-              { label: "Review with AI", kind: "primary", act: "agent", intent: "review_permit", prompt: "Review this work permit's safety checklist." },
               { label: "Approve", kind: "ghost", act: "approve" },
               { label: "Reject", kind: "ghost", act: "reject" },
             ],
@@ -362,6 +718,23 @@ const BUCKETS = {
           ),
         };
       });
+    },
+    // The suggestion tag is computed per VISIBLE PAGE, not in loadRows: loadRows
+    // also backs the 30s counts poll (see the `bucket_counts` handler), so a
+    // checklist read per permit there would fire ~50 calls every half minute for
+    // a number nobody reads. Ten reads when a page is actually opened is the
+    // cheap, honest place for it.
+    async enrichPage(jobs) {
+      await Promise.all(jobs.map(async (row) => {
+        try {
+          const resp = await callAction("cbre-clone", "get-work-permit-with-checklist", { permit_id: row.permit_id });
+          const tag = permitEvidence(unwrapChecklist(resp));
+          if (tag) { row.flag = tag.flag; row.tone = tag.tone; row.ai_note = tag.ai_note; }
+        } catch {
+          // A failed checklist read must leave the card untagged rather than
+          // tagged wrongly — an absent badge is honest, a guessed one is not.
+        }
+      }));
     },
   },
   referral: {
@@ -442,12 +815,199 @@ const BUCKETS = {
       });
     },
   },
+  stalled: {
+    label: BUCKET_LABELS.stalled,
+    module: "workorder",
+    signal: false,
+    // custom: the qualifying test is a REVERSE join — "has no PI" can only be
+    // answered from the procurement-initiation side (see STALLED WORK ORDERS
+    // above), which no per-record `filters` expression can express. Open state
+    // IS pushed server-side; the PI/PO exclusion is computed here.
+    custom: true,
+    async loadRows() {
+      // Open work orders, newest-modified first. No `expand`: expanding lookups
+      // returns whole nested records and blows the payload up ~3x, so site and
+      // vendor names come from small id→name maps instead.
+      const wos = [];
+      for (let page = 1; page <= 3; page++) {
+        const { records } = envelope(await callAction("facilio-cmms", "list-work-orders", {
+          page, page_size: 200,
+          filters: "moduleState=" + WO_OPEN_STATES.join(","),
+          sort_by: "modifiedTime", sort_order: "desc",
+          select: "id,serialNumber,subject,moduleState,priority,siteId,vendor,createdTime,modifiedTime," +
+            "associated_procurement_activity_workorder,purchase_order_workorder,po_id_workorder," +
+            "restrict_work_order_cancellation_workorder",
+        }));
+        wos.push(...records);
+        if (records.length < 200) break;
+      }
+
+      // Every procurement initiation, inverted to the work orders they cover.
+      let piWoIds = new Set();
+      try {
+        piWoIds = procuredWorkOrderIds(envelope(await callAction("facilio-cmms", "list-custom-module-records", {
+          custom_module: "custom_procurementinitiation", page_size: 200,
+          select: "id,moduleState,workorder_custom_procurementinitiation",
+        })).records);
+      } catch { piWoIds = new Set(); }
+
+      // Same inversion for purchase orders. Excludes nothing in this org today
+      // (no PO carries a work-order link) — kept so the bucket is correct the
+      // moment one does. Best-effort: a failed sweep must not empty the bucket.
+      let poWoIds = new Set();
+      try {
+        const pos = [];
+        for (let page = 1; page <= STALLED_PO_SCAN_PAGES; page++) {
+          const { records } = envelope(await callAction("facilio-cmms", "list-purchase-orders", {
+            page, page_size: 200, select: "id,associated_work_order_purchaseorder",
+          }));
+          pos.push(...records);
+          if (records.length < 200) break;
+        }
+        poWoIds = orderedWorkOrderIds(pos);
+      } catch { poWoIds = new Set(); }
+
+      const stalled = wos.filter((w) => workOrderIsStalled(w, piWoIds, poWoIds));
+      const sites = stalled.length ? await siteMap() : {};
+      const vendors = stalled.some((w) => lookupId(w.vendor)) ? await vendorMap() : {};
+
+      return stalled.map((w) => {
+        const id = w.id;
+        const ref = "WO-" + (w.serialNumber || id);
+        const site = sites[lookupId(w.siteId)] || "";
+        const vendor = vendors[lookupId(w.vendor)] || "";
+        const age = ageLabelFrom(w.createdTime);
+        const state = String(nameOf(w.moduleState) || w.moduleState || "");
+        // `assignedTo` is empty on every work order in this org and the Building
+        // lookup on all but 11, so neither is put in the meta line — an empty
+        // "Assignee: —" teaches the reader nothing.
+        const meta = [site || null, vendor ? "Vendor: " + vendor : null, age || null].filter(Boolean).join(" · ");
+        const url = recordUrl("workorder", id);
+        return {
+          external_id: "stalled:workorder:" + id, ref,
+          bucket: "stalled", bucket_label: BUCKET_LABELS.stalled, source_module: "workorder",
+          title: w.subject || "(no subject)",
+          // Priority is genuinely populated here (High/Medium/Low across 281 of
+          // 283), so the tone is read off the record rather than invented. No
+          // flag: nothing in the data supports an urgency claim beyond priority
+          // — in particular every work order in this org is under 24h old, so
+          // there is no "idle for N days" story to tell.
+          priority: nameOf(w.priority) || "Normal",
+          tone: findingTone(nameOf(w.priority)), flag: "",
+          meta, ai_note: "", age_label: age, status: state,
+          site, tenant: "", vendor, requested_by: "",
+          local_id: w.serialNumber ? String(w.serialNumber) : "",
+          created_time: w.createdTime || "", valid_from: "", valid_to: "",
+          record_url: url,
+          system_modified_time: w.modifiedTime || "",
+          // No primary action. The natural next step is "initiate procurement",
+          // but agent_bridge's start_async resolves every non-permit intent's
+          // record as a SERVICE REQUEST (it reads sr.moduleState and passes
+          // sr_id), so pointing an `act: "agent"` button at a workorder id would
+          // open the panel on the wrong record — and adding a work-order intent
+          // means editing agent_bridge.js, which is out of scope here. Dismiss
+          // uses the generic `act: "action"` path, which already has a real
+          // workorder branch (facilio-cmms.add-work-order-comment).
+          actions: withView([{ label: "Dismiss", kind: "ghost", act: "action" }], url),
+        };
+      });
+    },
+  },
+  spot: {
+    label: BUCKET_LABELS.spot,
+    module: "workorder",
+    signal: false,
+    // custom: the qualifying test is a CROSS-RECORD join ("the same vendor has
+    // ANOTHER reopened work assignment"), which no per-record `filters`
+    // expression can express — see SPOT CHECKS above. Classification IS pushed
+    // server-side; the in-progress, reopen and vendor tests run here over the
+    // one page that comes back.
+    custom: true,
+    async loadRows() {
+      // Every work assignment, in one sweep: the same set supplies both the
+      // candidates and the reopen evidence, so no second query is needed. No
+      // `expand` (it triples the payload); names come from id→name maps.
+      const was = [];
+      for (let page = 1; page <= 3; page++) {
+        const { records } = envelope(await callAction("facilio-cmms", "list-work-orders", {
+          page, page_size: 200,
+          filters: "work_classification_workorder=" + SPOT_WORK_CLASSIFICATION,
+          sort_by: "modifiedTime", sort_order: "desc",
+          select: "id,serialNumber,subject,moduleState,priority,siteId,vendor,createdTime,modifiedTime," +
+            "work_classification_workorder,reason_for_reopening_workorder," +
+            "inspection_workorder,spot_check_initiated__workorder",
+        }));
+        was.push(...records);
+        if (records.length < 200) break;
+      }
+
+      const candidates = qualifyingSpotChecks(was);
+      const sites = candidates.length ? await siteMap() : {};
+      const vendors = candidates.length ? await vendorMap() : {};
+
+      return candidates.map((c) => {
+        const w = c.wo;
+        const id = w.id;
+        const ref = "WA-" + (w.serialNumber || id);
+        const site = sites[lookupId(w.siteId)] || "";
+        const vendor = vendors[c.vendorId] || "";
+        const age = ageLabelFrom(w.createdTime);
+        const state = String(nameOf(w.moduleState) || w.moduleState || "");
+        const n = c.reopened.length;
+        // The flag reason is COUNTED from the evidence records, never asserted.
+        const why = "Vendor has " + n + " reopened work assignment" + (n === 1 ? "" : "s");
+        const refs = c.reopened.slice(0, 3).map((e) => "WA-" + (e.serialNumber || e.id));
+        const meta = [why, site || null, vendor ? "Vendor: " + vendor : null, age || null]
+          .filter(Boolean).join(" · ");
+        const url = recordUrl("workorder", id);
+        return {
+          external_id: "spot:workorder:" + id, ref,
+          bucket: "spot", bucket_label: BUCKET_LABELS.spot, source_module: "workorder",
+          title: w.subject || "(no subject)",
+          priority: nameOf(w.priority) || "Normal",
+          tone: "#FFD405", flag: "Vendor reopens",
+          meta,
+          // Cites the actual evidence records so the FM can check the claim.
+          ai_note: why + (refs.length ? " — reopened elsewhere: " + refs.join(", ") + (n > refs.length ? " (+" + (n - refs.length) + " more)" : "") : ""),
+          age_label: age, status: state,
+          site, tenant: "", vendor, requested_by: "",
+          local_id: w.serialNumber ? String(w.serialNumber) : "",
+          created_time: w.createdTime || "", valid_from: "", valid_to: "",
+          record_url: url,
+          system_modified_time: w.modifiedTime || "",
+          // VIEW ONLY — deliberately no "Initiate Spot Check" primary. The real
+          // button (3380565) would be run via
+          //   facilio-cmms.execute-record-action
+          //   { moduleName:"workorder", recordId, buttonType:"customButton", buttonId:3380565 }
+          // but that path is NOT verified: `get-record-actions` returns an EMPTY
+          // customButtons list for every work assignment probed (the button is
+          // gated on `type != 517` and on 7 FM roles this session's user is not
+          // in), and the org holds ZERO published inspection templates, so the
+          // workflow it fires has nothing to raise the inspection from. Wiring a
+          // write that cannot be proven to work would be worse than a dead
+          // button. Restore the primary once a probe shows the button in
+          // `customButtons` for a live record.
+          actions: withView([], url),
+        };
+      });
+    },
+  },
   // ── signal buckets (stored rows from the app DB, see SIGNAL BUCKETS above) ──
   sla: signalBucketDef("sla"),
   quoting: signalBucketDef("quoting"),
   invoicing: signalBucketDef("invoicing"),
   // ── more buckets added here as you provide module + criteria ──
 };
+
+// id → name map for sites (fetched once, 15 records).
+async function siteMap() {
+  try {
+    const recs = envelope(await callAction("facilio-cmms", "list-sites", { select: "id,name", page_size: 200 })).records;
+    const m = {};
+    for (const s of recs) m[s.id] = s.name;
+    return m;
+  } catch { return {}; }
+}
 
 // id → name map for vendors (fetched once, ~87 records).
 async function vendorMap() {
@@ -459,15 +1019,28 @@ async function vendorMap() {
   } catch (e) { return {}; }
 }
 
-function hiddenSet(d, bucketId) {
-  try {
-    const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [bucketId + ":%"]);
-    return new Set(rows.map((r) => r.external_id));
-  } catch (e) { return new Set(); }
+// The external_ids already actioned in this bucket, as the bucket spells them
+// TODAY. `aliases` are bucket ids this one absorbed (tsr absorbed tsrack): their
+// rows are rewritten onto the current prefix, so a request actioned back when the
+// queues were split stays hidden instead of reappearing under its new id.
+function hiddenSet(d, bucketId, aliases) {
+  const out = new Set();
+  for (const prefix of [bucketId].concat(aliases || [])) {
+    try {
+      const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [prefix + ":%"]);
+      for (const r of rows) {
+        const eid = String(r.external_id);
+        out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
+      }
+    } catch (e) { /* a dead read must not un-hide everything */ }
+  }
+  return out;
 }
-function hiddenCount(d, bucketId) {
-  try { return d.query("select count(*)::int as c from job_state where action_taken = 'true' and external_id like $1", [bucketId + ":%"]).rows[0].c; }
-  catch (e) { return 0; }
+// Deliberately the size of the (deduped, rewritten) set rather than its own
+// count(*): with aliases in play the same record can be recorded under two
+// prefixes, and counting rows would subtract it twice from the bucket total.
+function hiddenCount(d, bucketId, aliases) {
+  return hiddenSet(d, bucketId, aliases).size;
 }
 
 // ---- handlers --------------------------------------------------------------
@@ -485,7 +1058,7 @@ server.addHandler({
         let count;
         if (b.custom) {
           const rows = await b.loadRows();
-          const hidden = hiddenSet(d, id);
+          const hidden = hiddenSet(d, id, b.aliases);
           count = rows.filter((r) => !hidden.has(r.external_id)).length;
           out.push({ bucket: id, label: b.label, signal: !!b.signal, count });
           continue;
@@ -499,7 +1072,7 @@ server.addHandler({
           if (b.filters) input.filters = b.filters;
           count = envelope(await callAction(b.connection, b.action, input)).count || 0;
         }
-        const hidden = hiddenCount(d, id);
+        const hidden = hiddenCount(d, id, b.aliases);
         out.push({ bucket: id, label: b.label, signal: !!b.signal, count: Math.max(0, count - hidden) });
       } catch (e) {
         out.push({ bucket: id, label: b.label, signal: !!b.signal, count: null, error: String(e.message || e).slice(0, 160) });
@@ -527,10 +1100,13 @@ server.addHandler({
     const pageSize = Math.min(Math.max(1, args && args.pageSize ? Number(args.pageSize) : 10), 50);
 
     if (b.custom) {
-      const hidden = hiddenSet(d, id);
+      const hidden = hiddenSet(d, id, b.aliases);
       const all = (await b.loadRows()).filter((r) => !hidden.has(r.external_id));
       const total = all.length;
       const jobs = all.slice((page - 1) * pageSize, page * pageSize);
+      // Per-page enrichment: extra reads a bucket only wants for rows actually
+      // on screen. Deliberately outside loadRows(), which the counts poll shares.
+      if (b.enrichPage) await b.enrichPage(jobs);
       return { bucket: id, jobs, page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)), ranAt: nowIso() };
     }
 
@@ -547,7 +1123,7 @@ server.addHandler({
     let ctxFor = () => ({});
     if (b.resolveVendors) { const vm = await vendorMap(); ctxFor = (r) => ({ vendorName: vm[r.vendor && r.vendor.id] }); }
 
-    const hidden = hiddenSet(d, id);
+    const hidden = hiddenSet(d, id, b.aliases);
     const jobs = records.map((r) => b.toRow(r, ctxFor(r))).filter((row) => !hidden.has(row.external_id));
 
     let rawTotal;
@@ -558,7 +1134,7 @@ server.addHandler({
     } else {
       rawTotal = count || records.length;
     }
-    const total = Math.max(0, rawTotal - hiddenCount(d, id));
+    const total = Math.max(0, rawTotal - hiddenCount(d, id, b.aliases));
     return { bucket: id, jobs, page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)), ranAt: nowIso() };
   },
 });
@@ -685,7 +1261,7 @@ server.addHandler({
   name: "create_tenant_quote",
   description: "Create a tenant quote record in Facilio for a service request. The FM enters only the amount; every other field is pulled from the SR.",
   parameters: {
-    external_id: { description: "external_id of the job (tsrack:servicerequest:<id>)", type: "string" },
+    external_id: { description: "external_id of the job (tsr:servicerequest:<id>; legacy tsrack:servicerequest:<id> still parses)", type: "string" },
     amount: { description: "The quoted amount entered by the FM", type: "number" },
     actor: { description: "Optional name/email of who created it", type: "string" },
   },

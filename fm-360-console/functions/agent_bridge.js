@@ -661,6 +661,31 @@ const OPENINGS = {
     "acknowledgement details — tenant rechargeable, issue type (keep or change), and quote path if it will be " +
     "handled as a quote — and wait for the FM's explicit confirmation in this chat. Only acknowledge after " +
     "the FM confirms.",
+  // The console's single service-request queue opens an unacknowledged request
+  // with THIS intent: one conversation that acknowledges and then goes straight on
+  // to the work order. The two-confirmation rule is the whole point — the flow is
+  // continuous for the FM, not automatic. Neither write happens without its own
+  // explicit yes, and this opening must never be shortened into pre-consent.
+  tsr_flow:
+    "The FM wants this tenant service request taken all the way through in ONE conversation: acknowledge it, " +
+    "then raise its work order — in that order, both in this same chat. Do the whole flow here; the FM should " +
+    "not have to go back to the console and start a second conversation for the second step.\n" +
+    "STEP 1 — ACKNOWLEDGE. Before writing anything, present the proposed acknowledgement details — tenant " +
+    "rechargeable, issue type (keep or change), and quote path if it will be handled as a quote — and wait for " +
+    "the FM's explicit confirmation in this chat. Only acknowledge after the FM confirms.\n" +
+    "STEP 2 — WORK ORDER. As soon as the acknowledgement has actually landed, carry straight on in this same " +
+    "chat without waiting to be asked again: gather the work order inputs from the FM — the execution path, " +
+    "the work order type and priority (the valid options are listed in the OPTIONS block above — present them " +
+    "by name, do not look them up again), whether permits are mandatory (and which permit types if so), and " +
+    "any path-specific details the chosen path needs. Present the proposed values and wait for the FM's " +
+    "explicit confirmation in this chat; only create the work order after the FM confirms.\n" +
+    "EACH STEP GETS ITS OWN CONFIRMATION. The FM confirming the acknowledgement is NOT confirmation of the " +
+    "work order, and asking for this flow at the start is not confirmation of either. Never merge the two " +
+    "questions into one, and never treat 'yes' to step 1 as covering step 2. If the acknowledgement fails, say " +
+    "so and stop — do not raise a work order for a request that is not acknowledged.\n" +
+    "AFTER the work order is created, report its id, its reference number and a one-line summary of it here in " +
+    "this chat, and tell the FM they can continue in this same chat with the procurement initiation and the " +
+    "RFQ if the work is bought in.",
   create_work_order:
     "The FM wants to raise the WORK ORDER for this ALREADY-ACKNOWLEDGED tenant service request — do not " +
     "re-acknowledge it. Before creating anything, gather the work order inputs from the FM in this chat: the " +
@@ -707,12 +732,15 @@ async function runStart(args, progress) {
     const { sr, siteId, site, briefing: record } = await briefingFor(recordId);
     stateBefore = nameOf(sr.moduleState) || String(sr.moduleState ?? "");
     // Raising a work order needs picklists the agent would otherwise fetch one at
-    // a time mid-run; acknowledging needs none of them, so only pay for them here.
-    // The procurement initiation and the RFQ both follow the work order in this
-    // same thread, so the policy reads are worth paying for on the same turn —
-    // all of them in parallel, so the extra reads cost no extra wall clock.
+    // a time mid-run; a bare acknowledge needs none of them, so only pay for them
+    // on the intents that actually reach the work-order step. tsr_flow does reach
+    // it — it acknowledges and then carries on to the work order in the same
+    // thread — so it gets the same pre-fetch, which is what took that turn from
+    // ~84s down to ~12s. The procurement initiation and the RFQ both follow in
+    // this same thread, so the policy reads are worth paying for on the same turn
+    // — all of them in parallel, so the extra reads cost no extra wall clock.
     briefing = record;
-    if (intent === "create_work_order") {
+    if (intent === "create_work_order" || intent === "tsr_flow") {
       const [options, policy] = await Promise.all([
         workOrderOptions(),
         procurementContext(siteId, site),
@@ -815,7 +843,7 @@ const START_PARAMS = {
   external_id: { description: "external_id of the job (e.g. tsr:servicerequest:<id> or unblock:workpermit:<id>)", type: "string" },
   sr_id: { description: "Record id, when external_id isn't handy", type: "number" },
   message: { description: "Opening instruction (defaults to the intent's opening)", type: "string" },
-  intent: { description: "What is being started: 'acknowledge' (default), 'create_work_order', or 'review_permit'", type: "string" },
+  intent: { description: "What is being started: 'tsr_flow' (acknowledge then raise the work order, one conversation), 'acknowledge' (default), 'create_work_order', or 'review_permit'", type: "string" },
   team: { description: "Agent Studio agent link name (overrides the intent's default target)", type: "string" },
   actor: { description: "Optional name/email of the person acting", type: "string" },
   record_title: { description: "Optional record title the panel already shows (rides into the briefing)", type: "string" },

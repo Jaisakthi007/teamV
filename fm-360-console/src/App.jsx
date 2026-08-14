@@ -24,9 +24,11 @@ const C = {
   red: "#B61919", redSoft: "#FDE7E7", amber: "#8A6D00", amberSoft: "#FFF8D6",
   purple: "#5E3ED3", purpleSoft: "#F3EFFF", green: "#0F6F06",
 };
-const BUCKET_ORDER = ["tsr", "tsrack", "unblock", "referral", "completion", "findings", "stalled", "quotes", "spot", "tenant", "sla", "quoting", "invoicing"];
+// `tsrack` is gone: "TSR's to acknowledge" and "Acknowledged TSRs" are ONE queue
+// ("tsr") now, and each card carries its own state and its own next-step button.
+const BUCKET_ORDER = ["tsr", "unblock", "referral", "completion", "findings", "stalled", "quotes", "spot", "tenant", "sla", "quoting", "invoicing"];
 const DOT = {
-  tsr: C.red, tsrack: "#FFD405", unblock: "#FFD405", referral: "#FFD405", completion: C.blue,
+  tsr: C.red, unblock: "#FFD405", referral: "#FFD405", completion: C.blue,
   findings: C.blue, stalled: C.blue, quotes: C.blue, spot: C.purple, tenant: C.red,
   sla: C.amber, quoting: C.purple, invoicing: C.purple,
 };
@@ -36,6 +38,89 @@ function toneStyle(tone, priority) {
   if (t === "#FFD405" || t === C.amber) return { bar: "#FFD405", bg: C.amberSoft, fg: C.amber };
   if (t === C.purple) return { bar: C.purple, bg: C.purpleSoft, fg: C.purple };
   return { bar: C.blue, bg: C.blueSoft, fg: C.blue };
+}
+
+/**
+ * ── Loading captions ──────────────────────────────────────────────────────────
+ * Every set's FIRST entry is the plain, informative line, and it is always what a
+ * fast load shows; the lighter variants only appear on later rotations, so a
+ * 300ms response never gets a joke and a genuinely long wait develops some
+ * personality. Nothing here claims progress the app cannot see ("almost there"),
+ * blames anyone, or makes light of a hazard, an incident or a tenant's problem.
+ * Keep every line under ~60 chars: these sit on one reserved line and a wrap
+ * would move the page under the reader.
+ */
+const LOAD_BOOT = [
+  "Loading…",
+  "Opening the console",
+  "Collecting every queue worth your attention",
+];
+const LOAD_IMPORTANT = [
+  "Reading every action queue and ranking what's open…",
+  "Deciding what deserves your next hour",
+  "Sorting the urgent from the merely loud",
+  "Weighing what waited longest against what starts soonest",
+  "Asking every queue to justify its position",
+];
+const LOAD_QUEUE = [
+  "Loading this queue…",
+  "Fetching everything still open here",
+  "Putting the newest at the top",
+  "Turning rows into something you can act on",
+];
+// The Service Request Operations team delegates across four member agents, which
+// is exactly what the later lines describe.
+const LOAD_AGENT = [
+  "Working…",
+  "Reading the record before answering",
+  "Consulting four specialists who all want a word",
+  "Checking what has already been done on this one",
+  "Drafting something you can actually send",
+];
+// Work-permit review is a safety-critical path: this set stays dry and factual.
+const LOAD_PERMIT = [
+  "Reviewing this permit…",
+  "Reading the permit and its conditions",
+  "Checking the evidence on this permit",
+];
+const LOAD_FINDING = [
+  "Classifying responsibility…",
+  "Reading the description for who has to act",
+  "Deciding whether this one is the tenant's or ours",
+];
+const LOAD_DRILL = [
+  "Loading lines…",
+  "Fetching the referred lines on this order",
+  "Comparing the order against the invoice",
+  "Finding where the two sets of numbers disagree",
+];
+// One reserved line: the box keeps its height whichever caption is showing, so
+// rotation never nudges the content under it.
+const LOADER_LINE = { display: "block", minHeight: 20, lineHeight: "20px" };
+
+/**
+ * Rotate a loading caption every `intervalMs` while `active`.
+ *
+ * Deliberately restarts at index 0 on every activation — the plain line is what a
+ * quick load shows, and the wit is what a slow one earns. Under
+ * prefers-reduced-motion the caption is set once and never changes. No ARIA live
+ * region is attached anywhere this is used: a screen reader announcing a new
+ * caption every three seconds is worse than silence, and the text is in the DOM
+ * to be read on demand.
+ *
+ * `messages` must be a stable (module-level) array; it is an effect dependency.
+ */
+function useLoaderLine(messages, active = true, intervalMs = 3000) {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    setI(0);
+    if (!active || !messages || messages.length < 2) return undefined;
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) return undefined;
+    const id = setInterval(() => setI((n) => n + 1), intervalMs);
+    return () => clearInterval(id);
+  }, [active, intervalMs, messages]);
+  if (!messages || !messages.length) return "";
+  return messages[i % messages.length];
 }
 
 export default function App() {
@@ -185,7 +270,9 @@ export default function App() {
     const cls = findingCls[r.external_id];
     const out = { ...r };
     if (!cls || cls.status === "pending") {
-      out.ai_note = "Classifying responsibility…";
+      // `findingLine` is the rotating caption; it starts on the plain
+      // "Classifying responsibility…" so a quick verdict reads exactly as before.
+      out.ai_note = findingLine;
     } else if (cls.status === "done" && cls.actionBy === "Tenant") {
       out.ai_note = "Tenant to action — " + cls.reason;
       out.actions = [{ label: "Raise Letter of Non Compliance", kind: "primary", act: "action" }, ...(r.actions || [])];
@@ -258,9 +345,11 @@ export default function App() {
   async function takeAction(job, action) {
     if (action.act === "open") { if (job.record_url) window.open(job.record_url, "_blank", "noopener"); return; }
     if (action.act === "quote") { setQuote({ job }); setQuoteAmount(""); return; }
-    // Acknowledging a TSR is a conversation with the Service Request Operations
-    // team, not a one-shot write: the team performs the acknowledge and stays open
-    // for the follow-on steps (work order, procurement, RFQ).
+    // A TSR is a conversation with the Service Request Operations team, not a
+    // one-shot write. On an unacknowledged request ("Acknowledge & proceed",
+    // intent tsr_flow) that one conversation acknowledges AND then raises the work
+    // order — each on its own explicit confirmation — and stays open for the
+    // follow-on procurement and RFQ. The card's intent decides which flow opens.
     if (action.act === "agent") { openAgent(job, action); return; }
     if (action.act === "drill") { openDrill(job); return; }
     if (action.act === "approve" || action.act === "reject") {
@@ -355,8 +444,10 @@ export default function App() {
     runAgentTurn({ handler, args, job: agent.job, prompt: msg });
   }
 
-  // The team writes to the record, so re-read the feed on close: an acknowledged
-  // TSR leaves moduleState=Open and drops off this bucket on its own.
+  // The team writes to the record, so re-read the feed on close. Since the service
+  // request queue merged, an acknowledged TSR no longer drops OFF the queue — it
+  // moves from Open to tsrvalidated and STAYS, re-rendering with its new state pill
+  // and its next button. Re-reading is what makes that switch visible.
   async function closeAgent() {
     clearTimeout(agentTimer.current);
     setAgent(null);
@@ -449,7 +540,18 @@ export default function App() {
   // The landing view: Needs action with no queue opened. Signals never lands here.
   const showLanding = tab === "actions" && !bucket;
 
-  if (authed === null) return <Center>Loading…</Center>;
+  // Rotating captions. Each is idle (and its timer unmounted) unless the thing it
+  // describes is actually in flight, so nothing here re-renders the console while
+  // it is just sitting there.
+  const bootLine = useLoaderLine(LOAD_BOOT, authed === null);
+  const queueLine = useLoaderLine(LOAD_QUEUE, loadingPage);
+  const drillLine = useLoaderLine(LOAD_DRILL, !!drill && !drillData);
+  const findingLine = useLoaderLine(
+    LOAD_FINDING,
+    Object.values(findingCls).some((c) => c && c.status === "pending"),
+  );
+
+  if (authed === null) return <Center><span style={LOADER_LINE}>{bootLine}</span></Center>;
   if (authed === false)
     return (
       <Center>
@@ -535,10 +637,16 @@ export default function App() {
               )}
               <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
                 <h1 style={{ fontSize: 20, margin: 0 }}>{bucket ? (labelByBucket[bucket] || bucket) : "—"}</h1>
-                <span style={{ color: C.muted, fontSize: 13 }}>
-                  {pageData.total > 0
-                    ? `Showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, pageData.total)} of ${pageData.total} · live, newest first`
-                    : "No open items"}
+                {/* While a page loads the card list only dims, which says nothing
+                    about what is happening. The caption line is already here and
+                    already occupied, so borrowing it costs no vertical space and
+                    cannot shift the list underneath. */}
+                <span style={{ color: C.muted, fontSize: 13, ...LOADER_LINE }}>
+                  {loadingPage
+                    ? queueLine
+                    : pageData.total > 0
+                      ? `Showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, pageData.total)} of ${pageData.total} · live, newest first`
+                      : "No open items"}
                 </span>
               </div>
 
@@ -589,7 +697,7 @@ export default function App() {
           <div onClick={(e) => e.stopPropagation()} style={{ width: 760, maxWidth: "94vw", maxHeight: "88vh", overflow: "auto", background: C.card, borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(0,0,0,.3)" }}>
             <div style={{ fontSize: 17, fontWeight: 700 }}>Referred order · {drill.job.ref}</div>
             <div style={{ fontSize: 13, color: C.muted, marginBottom: 14 }}>Update each referred line's PO unit cost to match the invoice, or edit manually.</div>
-            {!drillData && <p style={{ color: C.muted }}>Loading lines…</p>}
+            {!drillData && <p style={{ color: C.muted, ...LOADER_LINE }}>{drillLine}</p>}
             {drillData && !drillData.lines.length && <p style={{ color: C.muted }}>No referred lines found on this order.</p>}
             {drillData && drillData.lines.length > 0 && (
               <>
@@ -657,6 +765,10 @@ function AgentPanel({ agent, onSend, onClose }) {
   const { job, turns, busy, threadId } = agent;
   const isPermit = agent.intent === "review_permit";
   const panelTitle = AGENT_TITLES[agent.intent] || "Service Request Operations";
+  // A real progress note published by the bridge always wins — it says something
+  // true about this run. The rotating caption only fills the gap before the first
+  // note arrives, and on the permit path it stays factual.
+  const waitLine = useLoaderLine(isPermit ? LOAD_PERMIT : LOAD_AGENT, busy && !agent.note, 3200);
 
   // Replies arrive over the socket, so its health is worth showing while waiting.
   useEffect(() => vibe.onRealtimeState?.(setRtState), []);
@@ -697,8 +809,8 @@ function AgentPanel({ agent, onSend, onClose }) {
         <div ref={scroller} style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
           {turns.map((t, i) => <Turn key={i} turn={t} />)}
           {busy && (
-            <div style={{ alignSelf: "flex-start", background: C.purpleSoft, border: "1px solid #E4DBFF", color: C.purple, borderRadius: 12, padding: "9px 13px", fontSize: 13, maxWidth: "92%", lineHeight: 1.5 }}>
-              {agent.note || "Working…"}
+            <div style={{ alignSelf: "flex-start", background: C.purpleSoft, border: "1px solid #E4DBFF", color: C.purple, borderRadius: 12, padding: "9px 13px", fontSize: 13, maxWidth: "92%", minHeight: 20, lineHeight: 1.5 }}>
+              {agent.note || waitLine}
             </div>
           )}
         </div>
@@ -791,6 +903,9 @@ function renderMd(text) {
 function ImportantNow({ items, busy, error, at, onPick, onRetry }) {
   const loading = items === null;
   const list = items || [];
+  // Ranking three connection reads is the console's longest routine wait, so this
+  // is the one caption an FM will actually watch rotate.
+  const rankLine = useLoaderLine(LOAD_IMPORTANT, loading, 3400);
   const queues = new Set(list.map((it) => it.bucket)).size;
   return (
     <section style={{ maxWidth: 1040 }}>
@@ -823,7 +938,9 @@ function ImportantNow({ items, busy, error, at, onPick, onRetry }) {
         </div>
       )}
 
-      {loading && <p style={{ color: C.muted, fontSize: 13.5 }}>Reading every action queue and ranking what's open…</p>}
+      {/* The header caption above stays the static "ranking every queue…": two
+          lines rotating at once on the same screen is noise, not character. */}
+      {loading && <p style={{ color: C.muted, fontSize: 13.5, ...LOADER_LINE }}>{rankLine}</p>}
 
       {!loading && !list.length && !error && (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "30px 24px", textAlign: "center" }}>
@@ -973,6 +1090,11 @@ function Card({ r, acting, onAction }) {
           <span style={{ fontSize: 12.5, fontWeight: 700, color: C.muted, letterSpacing: 0.3 }}>{r.ref}</span>
           {r.local_id && <span style={{ fontSize: 11.5, color: C.muted }}>#{r.local_id}</span>}
           {r.flag && <Pill bg={flagS.bg} fg={flagS.fg}>{r.flag}</Pill>}
+          {/* A second, optional flag. The merged service-request queue needs both
+              facts at once — the record's state AND whether it is rechargeable —
+              and one of them displacing the other is what made the old split
+              queues readable. Additive: buckets that set no flag2 are unchanged. */}
+          {r.flag2 && <Pill bg={flagS.bg} fg={flagS.fg}>{r.flag2}</Pill>}
           {r.priority && r.priority !== "Normal" && <Pill bg={flagS.bg} fg={flagS.fg}>{r.priority}</Pill>}
         </div>
         <div style={{ fontSize: 15.5, fontWeight: 600, marginBottom: 5, lineHeight: 1.3, color: C.ink }}>{r.title}</div>

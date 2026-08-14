@@ -165,12 +165,19 @@ function recordUrl(module, id) {
 }
 
 const SOURCES = [
+  // ONE service-request source, matching the console's single queue. The two
+  // states used to be scanned as two buckets, which meant the per-bucket cap in
+  // `important` handed service requests twice the strip's share of any other
+  // queue, and "Open queue →" could land the FM in the half the record was not in.
+  // Comma-separated values are an IN/OR on this action (verified on org 2931:
+  // 136 Open + 19 tsrvalidated = 155 for the pair), so one read covers both.
+  // Kept in step with feed.js by hand — this function is self-contained on purpose.
   {
-    bucket: "tsr", label: "TSR's to acknowledge", connection: "facilio-cmms",
+    bucket: "tsr", label: "Tenant service requests", connection: "facilio-cmms",
     action: "list-service-requests",
     input: {
-      filters: "moduleState=Open", expand: "siteId,tenant,tenant_serviceRequest_1",
-      select: "id,localId,subject,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime",
+      filters: "moduleState=Open,tsrvalidated", expand: "siteId,tenant,tenant_serviceRequest_1",
+      select: "id,localId,subject,moduleState,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime,tenant_rechargeable__serviceRequest,tenant_quote_path_serviceRequest",
       page: 1, page_size: 50, sort_by: "sysCreatedTime", sort_order: "asc",
     },
     map: (r) => ({
@@ -180,24 +187,8 @@ const SOURCES = [
       created_time: r.sysCreatedTime || "",
       tenant: nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant),
       site: nameOf(r.siteId),
-      record_url: recordUrl("serviceRequest", r.id),
-    }),
-  },
-  {
-    bucket: "tsrack", label: "Acknowledged TSRs", connection: "facilio-cmms",
-    action: "list-service-requests",
-    input: {
-      filters: "moduleState=tsrvalidated", expand: "siteId,tenant,tenant_serviceRequest_1",
-      select: "id,localId,subject,siteId,tenant,tenant_serviceRequest_1,sysCreatedTime,tenant_rechargeable__serviceRequest,tenant_quote_path_serviceRequest",
-      page: 1, page_size: 50, sort_by: "sysCreatedTime", sort_order: "asc",
-    },
-    map: (r) => ({
-      external_id: "tsrack:servicerequest:" + r.id,
-      ref: "TSR-" + (r.localId && r.localId !== 0 ? r.localId : r.id),
-      title: r.subject || "(no subject)",
-      created_time: r.sysCreatedTime || "",
-      tenant: nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant),
-      site: nameOf(r.siteId),
+      // Only acknowledged requests carry these, so they score only where they are
+      // real — an unacknowledged row simply has nothing to say on either.
       rechargeable: r.tenant_rechargeable__serviceRequest === true,
       quote_path: r.tenant_quote_path_serviceRequest || "",
       record_url: recordUrl("serviceRequest", r.id),
