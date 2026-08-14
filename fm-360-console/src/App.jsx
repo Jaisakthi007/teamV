@@ -8,7 +8,12 @@ const AGENT_TOPIC = "srops";       // where agent_bridge publishes each turn's r
 const AGENT_TIMEOUT_MS = 660000;   // just past the run's 600s ceiling; a killed run never publishes
 const newRunId = () =>
   (globalThis.crypto?.randomUUID?.() ?? "run-" + Math.random().toString(36).slice(2) + Date.now().toString(36));
-const BUILD = "v17 · agent panel + referral/findings";
+const BUILD = "v19 · unblock: Review with AI (review_work_permits)";
+// Vibe app agent that decides who must act on a finding (Tenant | FM | Unclear).
+const FINDING_CLASSIFIER = "finding-classifier";
+// What the agent panel's header calls each intent's agent; anything unlisted is
+// the Service Request Operations team.
+const AGENT_TITLES = { review_permit: "Review Work Permits" };
 
 const C = {
   bg: "#F7F9FC", card: "#FFFFFF", border: "#D8E3F1", ink: "#283648",
@@ -48,7 +53,12 @@ export default function App() {
   const [drillData, setDrillData] = useState(null); // { po, lines, autoMatch }
   const [drillEdits, setDrillEdits] = useState({}); // lineId -> new unit price (string)
   const [drillBusy, setDrillBusy] = useState(false);
+  const [important, setImportant] = useState([]);
   const [toast, setToast] = useState(null);
+  // external_id -> { status: "pending"|"done"|"error", actionBy?, reason? }
+  // Cached for the session so a finding is classified once, not per page render.
+  const [findingCls, setFindingCls] = useState({});
+  const clsInFlight = useRef(new Set());
   const [lastTick, setLastTick] = useState(null);
   const [live, setLive] = useState(true);
   const stateRef = useRef({ bucket: null, page: 1, counts: [] });
@@ -64,6 +74,7 @@ export default function App() {
         setAuthed(ok);
         if (ok) {
           setUser(await vibe.getCurrentUser().catch(() => null));
+          refreshImportant();
           const cs = await refreshCounts();
           const first = firstVisible(cs, "actions");
           if (first) { setBucket(first); await loadPage(first, 1); }
@@ -120,6 +131,72 @@ export default function App() {
     });
     return () => sub.unsubscribe();
   }, [authed]); // eslint-disable-line
+
+  // ── Findings: Tenant/FM responsibility, decided from the description by an LLM ──
+  // The feed's bucket handler stays synchronous; classification happens lazily
+  // from the browser after the page renders — once per finding, cached in state.
+  useEffect(() => {
+    if (!authed) return;
+    for (const j of (pageData.jobs || [])) {
+      if (j.bucket === "findings") classifyFinding(j);
+    }
+  }, [authed, pageData]); // eslint-disable-line
+
+  async function classifyFinding(job) {
+    const key = job.external_id;
+    if (findingCls[key] || clsInFlight.current.has(key)) return;
+    clsInFlight.current.add(key);
+    setFindingCls((m) => ({ ...m, [key]: { status: "pending" } }));
+    try {
+      const input = [
+        "Subject: " + (job.title || ""),
+        "Description: " + (job.description || ""),
+        "Source: " + (job.meta || ""),
+      ].join("\n");
+      const res = await vibe.executeAgent(FINDING_CLASSIFIER, input);
+      const raw = res?.response?.content;
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      // Validate the agent's reply before it drives any UI action — never guess.
+      const actionBy = ["Tenant", "FM", "Unclear"].includes(parsed?.actionBy) ? parsed.actionBy : "Unclear";
+      setFindingCls((m) => ({ ...m, [key]: { status: "done", actionBy, reason: String(parsed?.reason || "") } }));
+    } catch {
+      // Failed classification = no special button (same as Unclear), no retry storm.
+      setFindingCls((m) => ({ ...m, [key]: { status: "error" } }));
+    } finally {
+      clsInFlight.current.delete(key);
+    }
+  }
+
+  // Merge a finding's classification into its card: the responsibility button is
+  // added client-side when the verdict lands; before that a subtle placeholder shows.
+  function decorateFinding(r) {
+    if (r.bucket !== "findings") return r;
+    const cls = findingCls[r.external_id];
+    const out = { ...r };
+    if (!cls || cls.status === "pending") {
+      out.ai_note = "Classifying responsibility…";
+    } else if (cls.status === "done" && cls.actionBy === "Tenant") {
+      out.ai_note = "Tenant to action — " + cls.reason;
+      out.actions = [{ label: "Raise Letter of Non Compliance", kind: "primary", act: "action" }, ...(r.actions || [])];
+    } else if (cls.status === "done" && cls.actionBy === "FM") {
+      out.ai_note = "FM to resolve — " + cls.reason;
+      out.actions = [{ label: "Create Work Order", kind: "primary", act: "action" }, ...(r.actions || [])];
+    } else if (cls.status === "done") {
+      out.ai_note = cls.reason ? "Responsibility unclear — " + cls.reason : "Responsibility unclear.";
+    } else {
+      out.ai_note = ""; // classification failed: keep the card usable, add nothing
+    }
+    return out;
+  }
+
+  // Ranked cross-bucket triage. Never allowed to break the feed: on any failure
+  // the strip simply renders nothing.
+  async function refreshImportant() {
+    try {
+      const r = await vibe.executeFunction("triage", "important", { limit: 6 });
+      setImportant(Array.isArray(r?.items) ? r.items : []);
+    } catch (e) { setImportant([]); }
+  }
 
   async function refreshCounts() {
     try {
@@ -221,21 +298,29 @@ export default function App() {
 
   function openAgent(job, action) {
     // The bubble shows the FM's intent; the message itself is omitted so the
-    // bridge's intent-based opening applies — it instructs the team to present
-    // the action's details and wait for the FM's confirmation before writing.
+    // bridge's intent-based opening applies — it instructs the agent to present
+    // the action's details and wait for explicit confirmation before writing
+    // (for permits: recommend with evidence, decide only when told to).
     const opening = action.prompt || "Acknowledge this tenant service request.";
-    setAgent({ job, threadId: null, turns: [], busy: false, runId: null });
-    runAgentTurn({ handler: "start_async", args: { external_id: job.external_id, actor, intent: action.intent }, job, prompt: opening });
+    setAgent({ job, intent: action.intent, threadId: null, turns: [], busy: false, runId: null });
+    runAgentTurn({
+      handler: "start_async",
+      args: { external_id: job.external_id, actor, intent: action.intent, record_title: job.title, record_ref: job.ref },
+      job, prompt: opening,
+    });
   }
 
   function sendAgent(text) {
     const msg = String(text || "").trim();
     if (!msg || !agent || agent.busy) return;
     // Before the first reply lands there is no thread yet, so this prompt opens one.
-    const srId = Number(String(agent.job.external_id || "").split(":").pop()) || undefined;
+    const seg = String(agent.job.external_id || "").split(":");
+    // The bridge's record-state fast-path reads service requests only — a permit
+    // id sent as sr_id would read the wrong module, so gate it on the module here.
+    const srId = seg[seg.length - 2] === "servicerequest" ? Number(seg[seg.length - 1]) || undefined : undefined;
     const [handler, args] = agent.threadId
-      ? ["send_async", { thread_id: agent.threadId, message: msg, sr_id: srId }]
-      : ["start_async", { external_id: agent.job.external_id, message: msg, actor }];
+      ? ["send_async", { thread_id: agent.threadId, message: msg, sr_id: srId, intent: agent.intent }]
+      : ["start_async", { external_id: agent.job.external_id, message: msg, actor, intent: agent.intent, record_title: agent.job.title, record_ref: agent.job.ref }];
     runAgentTurn({ handler, args, job: agent.job, prompt: msg });
   }
 
@@ -341,7 +426,7 @@ export default function App() {
         <strong style={{ fontSize: 16 }}>FM 360 Console</strong>
         <LiveDot live={live} lastTick={lastTick} />
         <div style={{ flex: 1 }} />
-        <button style={btn(false)} onClick={() => { refreshCounts(); if (bucket) loadPage(bucket, page); }}>Refresh</button>
+        <button style={btn(false)} onClick={() => { refreshCounts(); refreshImportant(); if (bucket) loadPage(bucket, page); }}>Refresh</button>
         <div style={{ width: 34, height: 34, borderRadius: 9, background: C.indigo, color: "#fff", display: "grid", placeItems: "center", fontSize: 13, fontWeight: 600 }}>
           {(actor || "U").slice(0, 2).toUpperCase()}
         </div>
@@ -375,6 +460,7 @@ export default function App() {
         </div>
 
         <div style={{ padding: "22px 28px" }}>
+          {tab === "actions" && <ImportantNow items={important} onPick={selectBucket} />}
           <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
             <h1 style={{ fontSize: 20, margin: 0 }}>{bucket ? (labelByBucket[bucket] || bucket) : "—"}</h1>
             <span style={{ color: C.muted, fontSize: 13 }}>
@@ -386,7 +472,7 @@ export default function App() {
 
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 12, maxWidth: 900, opacity: loadingPage ? 0.55 : 1 }}>
             {records.map((r) => (
-              <Card key={r.external_id} r={r} acting={actingId === r.external_id} onAction={(a) => takeAction(r, a)} />
+              <Card key={r.external_id} r={decorateFinding(r)} acting={actingId === r.external_id} onAction={(a) => takeAction(r, a)} />
             ))}
             {!loadingPage && !records.length && <p style={{ color: C.muted }}>Nothing open in this bucket.</p>}
           </div>
@@ -484,15 +570,19 @@ export default function App() {
 }
 
 /**
- * The Service Request Operations team, docked on the right of the record it is
- * working on. The team acknowledges, then stays open for the follow-on steps —
- * raise the work order, start procurement, put it out to quote.
+ * The intent's Studio agent, docked on the right of the record it is working on.
+ * For service requests that is the Service Request Operations team (acknowledge,
+ * then the follow-on steps); for a work permit review it is the standalone
+ * Review Work Permits agent — recommendation with evidence first, approve or
+ * reject only when the reviewer explicitly says so in this chat.
  */
 function AgentPanel({ agent, onSend, onClose }) {
   const [draft, setDraft] = useState("");
   const [rtState, setRtState] = useState(vibe.realtimeState);
   const scroller = useRef(null);
   const { job, turns, busy, threadId } = agent;
+  const isPermit = agent.intent === "review_permit";
+  const panelTitle = AGENT_TITLES[agent.intent] || "Service Request Operations";
 
   // Replies arrive over the socket, so its health is worth showing while waiting.
   useEffect(() => vibe.onRealtimeState?.(setRtState), []);
@@ -521,7 +611,7 @@ function AgentPanel({ agent, onSend, onClose }) {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
               <span style={{ width: 8, height: 8, borderRadius: 8, background: C.purple, flex: "none" }} />
-              <strong style={{ fontSize: 14.5 }}>Service Request Operations</strong>
+              <strong style={{ fontSize: 14.5 }}>{panelTitle}</strong>
             </div>
             <div style={{ fontSize: 12.5, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {job.ref} · {job.title}
@@ -545,7 +635,11 @@ function AgentPanel({ agent, onSend, onClose }) {
               rows={2} value={draft} disabled={busy}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }}
-              placeholder={busy ? "Waiting for the team…" : "Ask the team to do something — raise the work order, start procurement…"}
+              placeholder={busy
+                ? (isPermit ? "Waiting for the agent…" : "Waiting for the team…")
+                : (isPermit
+                  ? "Ask about the evidence, or give your explicit decision on this permit…"
+                  : "Ask the team to do something — raise the work order, start procurement…")}
               style={{
                 flex: 1, resize: "none", padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit",
                 border: `1px solid ${C.border}`, borderRadius: 9, outline: "none", background: busy ? C.bg : C.card, color: C.ink,
@@ -585,18 +679,75 @@ function Turn({ turn }) {
   );
 }
 
-/** The agents answer in light markdown; bold and bullets are all that shows up. */
+/**
+ * The agents answer in light markdown: bold, bullets and — the permit reviewer
+ * especially — ATX headings ("## Recommendation"). Without the heading case the
+ * hashes render literally in the panel, so strip them and show the line as a
+ * heading instead.
+ */
 function renderMd(text) {
   return String(text || "").split("\n").map((line, i) => {
-    const bullet = /^\s*[-*•]\s+/.test(line);
-    const body = bullet ? line.replace(/^\s*[-*•]\s+/, "") : line;
+    const heading = /^\s*#{1,6}\s+/.test(line);
+    const bullet = !heading && /^\s*[-*•]\s+/.test(line);
+    let body = line;
+    if (heading) body = line.replace(/^\s*#{1,6}\s+/, "");
+    else if (bullet) body = line.replace(/^\s*[-*•]\s+/, "");
     const parts = body.split(/\*\*(.+?)\*\*/g).map((p, j) => (j % 2 ? <strong key={j}>{p}</strong> : p));
+    const style = heading
+      ? { fontWeight: 600, fontSize: 14, marginTop: i ? 8 : 0, marginBottom: 2 }
+      : bullet ? { paddingLeft: 14, textIndent: -9 } : undefined;
     return (
-      <div key={i} style={bullet ? { paddingLeft: 14, textIndent: -9 } : undefined}>
+      <div key={i} style={style}>
         {bullet ? "• " : null}{parts}
       </div>
     );
   });
+}
+
+/**
+ * The few things across every action bucket that most deserve the FM's next hour,
+ * ranked server-side. Each chip is a signal that actually fired for that record —
+ * never filler — so the ordering can always be read back as its reasons. Renders
+ * nothing at all when triage is empty or failed; it must never block the feed.
+ */
+function ImportantNow({ items, onPick }) {
+  if (!items || !items.length) return null;
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8 }}>
+        <h2 style={{ fontSize: 13, margin: 0, letterSpacing: 0.3, textTransform: "uppercase", color: C.indigo }}>Important now</h2>
+        <span style={{ fontSize: 12, color: C.muted }}>across every queue · most pressing first</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 900 }}>
+        {items.map((it, i) => (
+          <button
+            key={it.external_id}
+            onClick={() => onPick(it.bucket)}
+            title={`Go to ${it.bucket_label}`}
+            style={{
+              display: "flex", alignItems: "center", gap: 12, width: "100%", textAlign: "left",
+              background: C.card, border: `1px solid ${C.border}`, borderRadius: 10,
+              padding: "9px 14px", cursor: "pointer", font: "inherit", color: C.ink,
+            }}
+          >
+            <span style={{ fontSize: 12, fontWeight: 700, color: C.muted, width: 16, flex: "none" }}>{i + 1}</span>
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: C.muted, width: 78, flex: "none" }}>{it.ref}</span>
+            <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {it.title}
+            </span>
+            <span style={{ display: "flex", gap: 5, flex: "none", flexWrap: "wrap", justifyContent: "flex-end" }}>
+              {it.why.slice(0, 3).map((w, j) => (
+                <Pill key={j} bg={C.blueSoft} fg={C.blue}>{w}</Pill>
+              ))}
+            </span>
+            <span style={{ fontSize: 11.5, color: C.muted, width: 108, flex: "none", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {it.bucket_label}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function Card({ r, acting, onAction }) {

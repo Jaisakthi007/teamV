@@ -10,6 +10,15 @@ const TOPIC = "srops";
 // raise the work order, start procurement, raise the RFQ.
 const DEFAULT_TEAM = "service_request_operations";
 
+// Some intents belong to a different Studio agent than the SR team. The target
+// is derived from the intent; an explicit args.team still overrides both.
+const INTENT_AGENT = {
+  // Work permit reviews go to the standalone Review Work Permits agent (Flow AI
+  // 6390) — it reads the permit's safety checklist itself and recommends; it
+  // only approves/rejects on the reviewer's explicit per-permit instruction.
+  review_permit: "review_work_permits",
+};
+
 // ---- helpers (same shape as feed.js so both read alike) ---------------------
 function cfg(key) {
   try {
@@ -188,6 +197,30 @@ async function briefingFor(srId) {
   return { sr, briefing: lines.join("\n") };
 }
 
+/**
+ * The permit briefing is deliberately minimal: the Review Work Permits agent
+ * fetches its own checklist evidence through its tools — that is its design,
+ * and duplicating the read here would just be a second copy to drift. The
+ * title/ref ride in from the feed card the panel already holds, so no extra
+ * CMMS call is made.
+ */
+function permitBriefing(permitId, args) {
+  const title = nameOf(args && args.record_title);
+  const ref = args && args.record_ref ? String(args.record_ref) : "";
+  return [
+    "=== WORK PERMIT UNDER REVIEW ===",
+    "Permit record id: " + permitId,
+    ref ? "Console reference: " + ref : null,
+    title ? "Permit: " + title : null,
+    "=== END ===",
+    "",
+    "The reviewer is looking at this ONE work permit in the FM 360 Console.",
+    "The console has NOT read its checklist for you — fetch this permit's full safety",
+    "checklist with your own tools before saying anything about it.",
+    "Work only on this permit unless the reviewer explicitly asks about another.",
+  ].filter(Boolean).join("\n");
+}
+
 // ---- the work --------------------------------------------------------------
 
 /**
@@ -220,6 +253,31 @@ function statusProbe(message) {
   );
 }
 
+/**
+ * A turn can complete "ok" with no text at all — verified on thread 37006: the
+ * Create Work Order tool errored, the team ended its turn without emitting
+ * prose, and the panel rendered "(no reply)". An empty success is a hole, not
+ * an answer: ask the same thread to say plainly what just happened.
+ */
+const EMPTY_TURN_FALLBACK =
+  "The team finished this turn but sent no text back — ask it for a status update.";
+
+const EMPTY_TURN_PROBE =
+  "Your last turn ended without any text. In plain language, report what just happened on this request: " +
+  "what succeeded, what failed (with the exact error), and anything you still need from me. " +
+  "Do not redo the task and do not create anything new.";
+
+async function recoverEmptyReply(threadId, team) {
+  try {
+    const run = await callAction("facilio-ai-studio", "run-agent-chat", {
+      threadId, agent: team, message: EMPTY_TURN_PROBE,
+    });
+    return replyOf(run);
+  } catch (e) {
+    return null; // aborted or failed — the caller falls back to the honest string
+  }
+}
+
 /** The record's current state label — the fastest truth about whether a write landed. */
 async function stateOf(srId) {
   try {
@@ -244,7 +302,17 @@ async function chatTurn(threadId, team, message, opts) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const run = await callAction("facilio-ai-studio", "run-agent-chat", { threadId, agent: team, message });
-      return { reply: replyOf(run), pending: false, resent: attempt > 0 };
+      const reply = replyOf(run);
+      if (reply) return { reply, pending: false, resent: attempt > 0 };
+      // Completed but silent — never surface an empty turn. Ask the thread what
+      // happened and return that; if even that comes back empty, say so honestly.
+      const recovered = await recoverEmptyReply(threadId, team);
+      return {
+        reply: recovered || EMPTY_TURN_FALLBACK,
+        pending: false,
+        resent: attempt > 0,
+        recovered: true,
+      };
     } catch (e) {
       if (!isAbort(e)) throw e;
     }
@@ -266,12 +334,14 @@ async function chatTurn(threadId, team, message, opts) {
 
     await progress("The team is taking a while — checking whether it received the request…");
     let verdict = null; // "lost" -> resend; anything else is the team's own report
+    let emptyProbe = false; // a probe that completed ok but carried no text
     for (let i = 0; i < 4 && verdict == null; i++) {
       try {
         const run = await callAction("facilio-ai-studio", "run-agent-chat", {
           threadId, agent: team, message: statusProbe(message),
         });
-        const reply = replyOf(run) || "";
+        const reply = replyOf(run); // null for empty — an ok-but-silent probe says nothing; try again
+        if (reply == null) { emptyProbe = true; continue; }
         verdict = /NOT-RECEIVED/i.test(reply) ? "lost" : reply;
       } catch (e) {
         if (!isAbort(e)) throw e;
@@ -279,6 +349,11 @@ async function chatTurn(threadId, team, message, opts) {
     }
     if (verdict != null && verdict !== "lost") {
       return { reply: verdict, pending: false, resumed: true };
+    }
+    // Every probe that got through was silent: the thread is answering, just not
+    // with text. "Still working" would be a lie — return the honest fallback.
+    if (verdict == null && emptyProbe) {
+      return { reply: EMPTY_TURN_FALLBACK, pending: false, recovered: true };
     }
     if (verdict === "lost") await progress("The request was dropped in transit — resending it…");
     // verdict === "lost": the message never arrived — loop resends it.
@@ -295,60 +370,87 @@ async function chatTurn(threadId, team, message, opts) {
   };
 }
 
-async function runStart(args, progress) {
-  const srId = (args && args.sr_id) ? Number(args.sr_id) : recordIdOf(args && args.external_id);
-  if (!srId) throw new Error("external_id or sr_id is required");
-  const team = (args && args.team) || DEFAULT_TEAM;
+// The default openings demand confirmation explicitly: a bare "acknowledge this"
+// or "raise the work order" reads as pre-consent and lets the team write without
+// asking the FM anything. Each intent maps to a present-then-confirm opening.
+const OPENINGS = {
+  acknowledge:
+    "The FM wants to acknowledge this tenant service request. Before writing anything, present the proposed " +
+    "acknowledgement details — tenant rechargeable, issue type (keep or change), and quote path if it will be " +
+    "handled as a quote — and wait for the FM's explicit confirmation in this chat. Only acknowledge after " +
+    "the FM confirms.",
+  create_work_order:
+    "The FM wants to raise the WORK ORDER for this ALREADY-ACKNOWLEDGED tenant service request — do not " +
+    "re-acknowledge it. Before creating anything, gather the work order inputs from the FM in this chat: the " +
+    "execution path, the work order type and priority (the valid options are listed in the OPTIONS block " +
+    "above — present them by name, do not look them up again), " +
+    "whether permits are mandatory (and which permit types if so), and any path-specific details the chosen " +
+    "path needs. Present the proposed values and wait for the FM's explicit confirmation in this chat; only " +
+    "create the work order after the FM confirms. AFTER it is created, report the work order's id, its " +
+    "reference number and a one-line summary of it here in this chat, and tell the FM they can continue in " +
+    "this same chat with the procurement initiation and the RFQ if the work is bought in.",
+  // Mirrors the Review Work Permits agent's own contract (evidence first, one
+  // recommendation, act only on the reviewer's explicit per-permit instruction)
+  // rather than replacing it — the reminder reinforces, never weakens, its rules.
+  review_permit:
+    "The reviewer has opened the ONE work permit named in the briefing above. Read THAT permit's full safety " +
+    "checklist with your tools, then give your single recommendation for it with the evidence behind it — " +
+    "quoting the checklist questions and their notes exactly as written, including where notes were left " +
+    "blank — exactly as your review procedure requires. Do not pull the whole queue and do not review any " +
+    "other permit. Your own rules stand in full here: do NOT approve and do NOT reject this permit — or any " +
+    "permit — unless the reviewer explicitly instructs that exact decision on that exact permit later in " +
+    "this chat. Agreement with a recommendation, an 'ok' or a 'thanks' is not an instruction to act.",
+};
 
-  const { sr, briefing: record } = await briefingFor(srId);
-  const who = args && args.actor ? ` The FM acting is ${args.actor}.` : "";
-  // The default openings demand confirmation explicitly: a bare "acknowledge this"
-  // or "raise the work order" reads as pre-consent and lets the team write without
-  // asking the FM anything. Each intent maps to a present-then-confirm opening.
+async function runStart(args, progress) {
+  const recordId = (args && args.sr_id) ? Number(args.sr_id) : recordIdOf(args && args.external_id);
+  if (!recordId) throw new Error("external_id or sr_id is required");
   const intent = String((args && args.intent) || "acknowledge");
-  const OPENINGS = {
-    acknowledge:
-      "The FM wants to acknowledge this tenant service request. Before writing anything, present the proposed " +
-      "acknowledgement details — tenant rechargeable, issue type (keep or change), and quote path if it will be " +
-      "handled as a quote — and wait for the FM's explicit confirmation in this chat. Only acknowledge after " +
-      "the FM confirms.",
-    create_work_order:
-      "The FM wants to raise the WORK ORDER for this ALREADY-ACKNOWLEDGED tenant service request — do not " +
-      "re-acknowledge it. Before creating anything, gather the work order inputs from the FM in this chat: the " +
-      "execution path, the work order type and priority (the valid options are listed in the OPTIONS block " +
-      "above — present them by name, do not look them up again), " +
-      "whether permits are mandatory (and which permit types if so), and any path-specific details the chosen " +
-      "path needs. Present the proposed values and wait for the FM's explicit confirmation in this chat; only " +
-      "create the work order after the FM confirms. AFTER it is created, report the work order's id, its " +
-      "reference number and a one-line summary of it here in this chat, and tell the FM they can continue in " +
-      "this same chat with the procurement initiation and the RFQ if the work is bought in.",
-  };
+  // Target agent comes from the intent; an explicit args.team overrides.
+  const team = (args && args.team) || INTENT_AGENT[intent] || DEFAULT_TEAM;
+  const who = args && args.actor
+    ? ` The ${intent === "review_permit" ? "reviewer" : "FM"} acting is ${args.actor}.`
+    : "";
+
+  let briefing, stateBefore = null, title;
+  if (intent === "review_permit") {
+    // Minimal briefing by design — the agent reads its own checklist evidence.
+    // The record-state fast-path is SKIPPED for permits: stateOf reads service
+    // requests, and no cheap permit-state read exists (the awaiting-approval
+    // queue returns ~8KB per permit, unfiltered). Abort recovery still works
+    // through the delivery-check probes in chatTurn.
+    briefing = permitBriefing(recordId, args);
+    title = "FM 360 Console · Permit " + recordId;
+  } else {
+    const { sr, briefing: record } = await briefingFor(recordId);
+    stateBefore = nameOf(sr.moduleState) || String(sr.moduleState ?? "");
+    // Raising a work order needs picklists the agent would otherwise fetch one at
+    // a time mid-run; acknowledging needs none of them, so only pay for them here.
+    briefing = intent === "create_work_order" ? record + (await workOrderOptions()) : record;
+    title = "FM 360 Console · TSR " + recordId;
+  }
+
   const opening = OPENINGS[intent] || OPENINGS.acknowledge;
   const message =
     (args && args.message && String(args.message).trim()) || opening + who;
 
-  // Raising a work order needs picklists the agent would otherwise fetch one at a
-  // time mid-run; acknowledging needs none of them, so only pay for them here.
-  const briefing =
-    intent === "create_work_order" ? record + (await workOrderOptions()) : record;
-
   const thread = await callAction("facilio-ai-studio", "create-chat-thread", {
     agent: team,
-    title: "FM 360 Console · TSR " + srId,
+    title,
     additionalContext: briefing,
   });
   const threadId = threadIdOf(thread);
   if (!threadId) throw new Error("no threadId in create-chat-thread response: " + JSON.stringify(thread).slice(0, 300));
 
-  // The briefing rides along with the first message too, so the team acts on the
+  // The briefing rides along with the first message too, so the agent acts on the
   // record's real state even if one-shot context is trimmed.
   const turn = await chatTurn(threadId, team, `${briefing}\n\n${message}`, {
-    srId,
-    stateBefore: nameOf(sr.moduleState) || String(sr.moduleState ?? ""),
+    srId: stateBefore != null ? recordId : null,
+    stateBefore,
     progress,
   });
 
-  return { ok: true, srId, team, threadId, ...turn, sentAt: nowIso() };
+  return { ok: true, srId: recordId, team, threadId, ...turn, sentAt: nowIso() };
 }
 
 async function runSend(args, progress) {
@@ -356,11 +458,14 @@ async function runSend(args, progress) {
   if (!threadId) throw new Error("thread_id is required");
   const message = String((args && args.message) || "").trim();
   if (!message) throw new Error("message is required");
-  const team = (args && args.team) || DEFAULT_TEAM;
+  const intent = String((args && args.intent) || "");
+  const team = (args && args.team) || INTENT_AGENT[intent] || DEFAULT_TEAM;
 
   // Snapshot the record's state up front so an aborted turn can detect the
-  // write landing without waiting out the slow chat recovery.
-  const srId = (args && args.sr_id) ? Number(args.sr_id) : null;
+  // write landing without waiting out the slow chat recovery. Service requests
+  // only: stateOf reads get-service-request, so a permit id here would silently
+  // read a different module's record — permit turns skip the fast-path.
+  const srId = intent !== "review_permit" && args && args.sr_id ? Number(args.sr_id) : null;
   const stateBefore = srId ? await stateOf(srId) : null;
 
   const turn = await chatTurn(threadId, team, message, { srId, stateBefore, progress });
@@ -397,24 +502,27 @@ async function publishResult(kind, args, work) {
 // ---- handlers --------------------------------------------------------------
 
 const START_PARAMS = {
-  external_id: { description: "external_id of the job (tsr:servicerequest:<id>)", type: "string" },
-  sr_id: { description: "Service request record id, when external_id isn't handy", type: "number" },
+  external_id: { description: "external_id of the job (e.g. tsr:servicerequest:<id> or unblock:workpermit:<id>)", type: "string" },
+  sr_id: { description: "Record id, when external_id isn't handy", type: "number" },
   message: { description: "Opening instruction (defaults to the intent's opening)", type: "string" },
-  intent: { description: "What the FM is starting: 'acknowledge' (default) or 'create_work_order'", type: "string" },
-  team: { description: "Agent Studio team link name (defaults to service_request_operations)", type: "string" },
-  actor: { description: "Optional name/email of the FM acting", type: "string" },
+  intent: { description: "What is being started: 'acknowledge' (default), 'create_work_order', or 'review_permit'", type: "string" },
+  team: { description: "Agent Studio agent link name (overrides the intent's default target)", type: "string" },
+  actor: { description: "Optional name/email of the person acting", type: "string" },
+  record_title: { description: "Optional record title the panel already shows (rides into the briefing)", type: "string" },
+  record_ref: { description: "Optional console reference (e.g. PMT-12) for the briefing", type: "string" },
 };
 const SEND_PARAMS = {
   thread_id: { description: "Thread id returned by 'start'", type: "number" },
-  message: { description: "The FM's prompt", type: "string" },
-  sr_id: { description: "Service request record id, for fast state-change detection on aborted turns", type: "number" },
-  team: { description: "Agent Studio team link name (defaults to service_request_operations)", type: "string" },
+  message: { description: "The user's prompt", type: "string" },
+  sr_id: { description: "Service request record id, for fast state-change detection on aborted turns (service requests only)", type: "number" },
+  intent: { description: "The intent the thread was opened with — routes the turn to the same agent", type: "string" },
+  team: { description: "Agent Studio agent link name (overrides the intent's default target)", type: "string" },
 };
 
 server.addHandler({
   name: "start",
   description:
-    "Blocking variant: open an Agent Studio thread with the Service Request Operations team for one service request and return the team's first reply. Fine from the CLI; the console uses start_async because a team run outlasts a browser call.",
+    "Blocking variant: open an Agent Studio thread for one record with the intent's agent (SR team, or review_work_permits for review_permit) and return the first reply. Fine from the CLI; the console uses start_async because an agent run outlasts a browser call.",
   parameters: START_PARAMS,
   execute: (args) => runStart(args),
 });
@@ -422,7 +530,7 @@ server.addHandler({
 server.addHandler({
   name: "send",
   description:
-    "Blocking variant of a follow-up prompt into an existing Service Request Operations thread.",
+    "Blocking variant of a follow-up prompt into an existing agent thread.",
   parameters: SEND_PARAMS,
   execute: (args) => runSend(args),
 });
@@ -430,7 +538,7 @@ server.addHandler({
 server.addHandler({
   name: "start_async",
   description:
-    "What the console calls: open the Service Request Operations thread for a service request and publish the team's first reply to the 'srops' topic, tagged with run_id. Started with executeFunctionAsync so a long team run can't time the browser out.",
+    "What the console calls: open the intent's agent thread for a record and publish the first reply to the 'srops' topic, tagged with run_id. Started with executeFunctionAsync so a long agent run can't time the browser out.",
   parameters: { ...START_PARAMS, run_id: { description: "The panel's correlation id, echoed back on the event", type: "string" } },
   execute: (args) => publishResult("start", args, (progress) => runStart(args, progress)),
 });
@@ -438,7 +546,7 @@ server.addHandler({
 server.addHandler({
   name: "send_async",
   description:
-    "What the console calls for follow-up prompts: run the prompt in the existing thread and publish the team's reply to the 'srops' topic, tagged with run_id.",
+    "What the console calls for follow-up prompts: run the prompt in the existing thread and publish the agent's reply to the 'srops' topic, tagged with run_id.",
   parameters: { ...SEND_PARAMS, run_id: { description: "The panel's correlation id, echoed back on the event", type: "string" } },
   execute: (args) => publishResult("send", args, (progress) => runSend(args, progress)),
 });

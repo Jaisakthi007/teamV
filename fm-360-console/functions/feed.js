@@ -100,6 +100,75 @@ function findingTone(priority) {
 // ============================================================================
 
 // ============================================================================
+// SIGNAL BUCKETS — stored analytical rows read from the app DB's `signal`
+// table (written by sweep_jobs.signals / console_store.upsert_signals), NOT
+// live Facilio queries. Each row carries data_confidence (native | derived |
+// seeded); that provenance is surfaced on the card's flag so a seeded demo
+// row is never mistaken for a live finding.
+// ============================================================================
+const SIGNAL_BUCKET_IDS = ["sla", "quoting", "invoicing"];
+function signalTone(severity) {
+  const s = String(severity || "").toLowerCase();
+  if (s === "critical" || s === "high") return "#B61919";
+  if (s === "medium" || s === "warn" || s === "warning") return "#FFD405";
+  return "#5E3ED3";
+}
+// The signal table was provisioned by CSV import, so numeric columns come back
+// as text ("250", "25") — coerce before arithmetic or display.
+function numOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return isNaN(n) ? null : n;
+}
+function signalCard(r) {
+  const metric = numOrNull(r.metric_value);
+  const baseline = numOrNull(r.baseline_value);
+  const pct = numOrNull(r.variance_pct);
+  const parts = [];
+  // Lead quoting cards with the variance story so it survives the meta line's ellipsis.
+  if (r.bucket === "quoting" && metric != null && baseline != null) {
+    parts.push("Quoted " + metric + " vs rate card " + baseline + (pct != null ? " · " + (pct > 0 ? "+" : "") + pct + "%" : ""));
+  }
+  if (r.meta) parts.push(r.meta);
+  return {
+    external_id: r.external_id, ref: r.ref || "", bucket: r.bucket,
+    bucket_label: r.bucket_label || BUCKET_LABELS[r.bucket] || r.bucket,
+    source_module: r.source_module || "",
+    title: r.title || "(untitled signal)",
+    meta: parts.join(" · "),
+    ai_note: r.ai_note || "",
+    tone: signalTone(r.severity),
+    flag: r.data_confidence === "seeded" ? "Seeded demo" : (r.data_confidence === "derived" ? "Derived" : ""),
+    priority: "Signal",
+    site: r.site || "", tenant: r.tenant || "", vendor: r.vendor || "", requested_by: "",
+    local_id: "",
+    created_time: r.detected_at || "",
+    record_url: r.record_url || "",
+    system_modified_time: r.updated_at || "",
+    actions: [
+      { label: "View", kind: "ghost", act: "open" },
+      { label: "Dismiss", kind: "ghost", act: "action" },
+    ],
+  };
+}
+function signalBucketDef(id) {
+  return {
+    label: BUCKET_LABELS[id],
+    module: "signal",
+    signal: true,
+    custom: true, // reuses the custom-bucket path: loadRows + in-memory paging
+    async loadRows() {
+      const d = db();
+      const { rows } = d.query(
+        "select * from signal where bucket = $1 and status = 'open' and external_id <> '__seed__' order by detected_at desc",
+        [id]
+      );
+      return rows.map(signalCard);
+    },
+  };
+}
+
+// ============================================================================
 // LIVE BUCKET QUERIES
 // Each bucket is a LIVE query against Facilio — module + criteria evaluated at
 // read time (no stored copy). `filters` is the bucket's qualifying criteria;
@@ -225,7 +294,15 @@ const BUCKETS = {
           valid_from: iso(r.expectedStartTime), valid_to: iso(r.expectedEndTime),
           record_url: "",
           system_modified_time: iso(r.sysModifiedTime),
-          actions: [{ label: "Approve", kind: "primary", act: "approve" }, { label: "Reject", kind: "ghost", act: "reject" }],
+          // Review with AI opens the console's agent panel on the standalone
+          // Review Work Permits Studio agent (evidence first, decision only on the
+          // reviewer's explicit instruction in that chat). Approve/Reject stay as
+          // direct secondary actions — the agent path is additive, not a gate.
+          actions: [
+            { label: "Review with AI", kind: "primary", act: "agent", intent: "review_permit", prompt: "Review this work permit's safety checklist." },
+            { label: "Approve", kind: "ghost", act: "approve" },
+            { label: "Reject", kind: "ghost", act: "reject" },
+          ],
         };
       });
     },
@@ -293,11 +370,24 @@ const BUCKETS = {
           description: description,   // used by the browser for Tenant/FM classification
           record_url: "https://app.facilio.com/maintenance/goto/summary/finding/" + id,
           system_modified_time: r.sysModifiedTime || "",
-          actions: [{ label: "Close Finding", kind: "ghost", act: "action" }], // primary added client-side after AI classify
+          // The primary responsibility button (Raise Letter of Non Compliance /
+          // Create Work Order) is added CLIENT-SIDE once the finding-classifier
+          // agent's verdict lands; Unclear gets no primary — View/Close only.
+          // NOTE: no add-finding-comment action exists in this org, so the `act`
+          // handler's write step honestly reports syncStatus "skipped" for findings;
+          // the card still leaves the feed.
+          actions: [
+            { label: "Close Finding", kind: "ghost", act: "action" },
+            { label: "View", kind: "ghost", act: "open" },
+          ],
         };
       });
     },
   },
+  // ── signal buckets (stored rows from the app DB, see SIGNAL BUCKETS above) ──
+  sla: signalBucketDef("sla"),
+  quoting: signalBucketDef("quoting"),
+  invoicing: signalBucketDef("invoicing"),
   // ── more buckets added here as you provide module + criteria ──
 };
 
@@ -445,6 +535,14 @@ server.addHandler({
     if (syncStatus === "failed") {
       upsertState(d, args.external_id, "", actionType, now, "failed: " + syncError);
       return { ok: false, external_id: args.external_id, syncStatus, error: syncError };
+    }
+    // A dismissed signal is a stored row, not a live query — flip its status in
+    // the signal table too so it stays gone everywhere, not just via job_state.
+    // Idempotent: only open rows are touched.
+    if (SIGNAL_BUCKET_IDS.indexOf(seg[0]) >= 0) {
+      try {
+        d.query("update signal set status = 'dismissed', updated_at = $2 where external_id = $1 and status = 'open'", [args.external_id, now]);
+      } catch { /* job_state still hides it from the feed */ }
     }
     upsertState(d, args.external_id, "true", actionType, now, syncStatus);
     return { ok: true, external_id: args.external_id, action_type: actionType, syncStatus };
