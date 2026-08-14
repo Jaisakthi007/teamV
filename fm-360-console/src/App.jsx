@@ -8,7 +8,10 @@ const AGENT_TOPIC = "srops";       // where agent_bridge publishes each turn's r
 const AGENT_TIMEOUT_MS = 660000;   // just past the run's 600s ceiling; a killed run never publishes
 const newRunId = () =>
   (globalThis.crypto?.randomUUID?.() ?? "run-" + Math.random().toString(36).slice(2) + Date.now().toString(36));
-const BUILD = "v19 · unblock: Review with AI (review_work_permits)";
+const BUILD = "v20 · Important now is the landing page";
+// The landing view is a full page now, not a six-row strip above the feed, so it
+// asks triage for everything it will give (the handler caps at 12).
+const IMPORTANT_LIMIT = 12;
 // Vibe app agent that decides who must act on a finding (Tenant | FM | Unclear).
 const FINDING_CLASSIFIER = "finding-classifier";
 // What the agent panel's header calls each intent's agent; anything unlisted is
@@ -53,7 +56,10 @@ export default function App() {
   const [drillData, setDrillData] = useState(null); // { po, lines, autoMatch }
   const [drillEdits, setDrillEdits] = useState({}); // lineId -> new unit price (string)
   const [drillBusy, setDrillBusy] = useState(false);
-  const [important, setImportant] = useState([]);
+  const [important, setImportant] = useState(null); // null = not loaded yet, [] = loaded and empty
+  const [importantBusy, setImportantBusy] = useState(false);
+  const [importantError, setImportantError] = useState(null);
+  const [importantAt, setImportantAt] = useState(null);
   const [toast, setToast] = useState(null);
   // external_id -> { status: "pending"|"done"|"error", actionBy?, reason? }
   // Cached for the session so a finding is classified once, not per page render.
@@ -61,8 +67,8 @@ export default function App() {
   const clsInFlight = useRef(new Set());
   const [lastTick, setLastTick] = useState(null);
   const [live, setLive] = useState(true);
-  const stateRef = useRef({ bucket: null, page: 1, counts: [] });
-  stateRef.current = { bucket, page, counts };
+  const stateRef = useRef({ bucket: null, page: 1, counts: [], tab: "actions" });
+  stateRef.current = { bucket, page, counts, tab };
   const agentTimer = useRef(null);
 
   const actor = user?.user?.name || user?.user?.email || "";
@@ -74,10 +80,10 @@ export default function App() {
         setAuthed(ok);
         if (ok) {
           setUser(await vibe.getCurrentUser().catch(() => null));
+          // No bucket is opened on mount: "Important now" IS the landing view, and
+          // `bucket` stays null until the FM picks a queue.
           refreshImportant();
-          const cs = await refreshCounts();
-          const first = firstVisible(cs, "actions");
-          if (first) { setBucket(first); await loadPage(first, 1); }
+          await refreshCounts();
         }
       } catch (e) { setAuthed(false); }
     })();
@@ -98,6 +104,11 @@ export default function App() {
         const before = (prev.find((x) => x.bucket === b) || {}).count;
         const after = (cs.find((x) => x.bucket === b) || {}).count;
         if (before !== after) await loadPage(b, stateRef.current.page);
+      } else if (stateRef.current.tab === "actions") {
+        // On the landing view the ranked list is the only content on screen, so it
+        // is what has to stay live. Inside a queue it is off-screen and re-ranking
+        // three connection reads every tick would be waste.
+        await refreshImportant({ quiet: true });
       }
     };
     timer = setInterval(tick, POLL_MS);
@@ -189,13 +200,26 @@ export default function App() {
     return out;
   }
 
-  // Ranked cross-bucket triage. Never allowed to break the feed: on any failure
-  // the strip simply renders nothing.
-  async function refreshImportant() {
+  // Ranked cross-bucket triage — the landing view's content. A failure must still
+  // leave a page that says something true, so the last good ranking is kept where
+  // there is one, and the error is shown with a retry rather than a blank pane.
+  // `quiet` is for the 30s poll: it re-ranks in place without dimming the page the
+  // FM is reading. A refresh they asked for (mount, Refresh, Retry, coming home)
+  // does show its progress.
+  async function refreshImportant({ quiet } = {}) {
+    if (!quiet) setImportantBusy(true);
     try {
-      const r = await vibe.executeFunction("triage", "important", { limit: 6 });
+      const r = await vibe.executeFunction("triage", "important", { limit: IMPORTANT_LIMIT });
       setImportant(Array.isArray(r?.items) ? r.items : []);
-    } catch (e) { setImportant([]); }
+      setImportantAt(r?.ranAt || new Date().toISOString());
+      setImportantError(null);
+    } catch (e) {
+      // A failed 30s tick must not blank a page that was true a moment ago: the
+      // last ranking is kept and flagged as stale. Only a first load, with nothing
+      // worth keeping, falls back to the empty list.
+      setImportant((prev) => (Array.isArray(prev) && prev.length ? prev : []));
+      setImportantError(String(e?.message || e || "Triage is unavailable"));
+    } finally { if (!quiet) setImportantBusy(false); }
   }
 
   async function refreshCounts() {
@@ -207,6 +231,11 @@ export default function App() {
     } catch (e) { setLive(false); return stateRef.current.counts; }
   }
   async function loadPage(b, p) {
+    // The single choke point for every feed read. `bucket` is null on the landing
+    // view, and several callers (pagination, post-action reloads, the header
+    // Refresh) pass it straight through — one guard here keeps all of them from
+    // firing a bucket read with no bucket.
+    if (!b) return;
     setLoadingPage(true);
     try {
       const r = await vibe.executeFunction("feed", "bucket", { bucket: b, page: p, pageSize: PAGE_SIZE });
@@ -215,14 +244,16 @@ export default function App() {
     finally { setLoadingPage(false); }
   }
 
-  function firstVisible(cs, whichTab) {
-    return BUCKET_ORDER.find((b) => {
-      const c = cs.find((x) => x.bucket === b);
-      return c && (whichTab === "signals") === !!c.signal && (c.count || 0) > 0;
-    });
-  }
   async function selectBucket(b) { setBucket(b); setPage(1); await loadPage(b, 1); }
-  async function gotoPage(p) { if (p < 1 || p > pageData.totalPages) return; await loadPage(bucket, p); }
+  // Back to the landing view. The stale page is dropped so re-entering a queue can
+  // never flash the previous queue's cards under the new heading.
+  function goHome() {
+    setBucket(null);
+    setPage(1);
+    setPageData({ jobs: [], page: 1, totalPages: 1, total: 0 });
+    refreshImportant();
+  }
+  async function gotoPage(p) { if (!bucket || p < 1 || p > pageData.totalPages) return; await loadPage(bucket, p); }
 
   async function takeAction(job, action) {
     if (action.act === "open") { if (job.record_url) window.open(job.record_url, "_blank", "noopener"); return; }
@@ -398,13 +429,25 @@ export default function App() {
   const signalByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = !!c.signal)); return m; }, [counts]);
   const visibleBuckets = BUCKET_ORDER.filter((b) => counts.some((c) => c.bucket === b) && (tab === "signals") === !!signalByBucket[b] && (countByBucket[b] || 0) > 0);
 
+  // Keeps the selection honest as counts move and tabs switch.
+  //  · Signals has no landing view, so it still auto-opens its first queue.
+  //  · On Needs action the landing view is a legitimate place to be, so a queue is
+  //    never auto-opened; a queue that empties (or a Signals queue left behind by
+  //    switching tabs) drops the FM home instead of jumping to an unrelated queue.
   useEffect(() => {
-    if (authed && visibleBuckets.length && !visibleBuckets.includes(bucket)) selectBucket(visibleBuckets[0]);
+    if (!authed) return;
+    if (tab === "signals") {
+      if (visibleBuckets.length && !visibleBuckets.includes(bucket)) selectBucket(visibleBuckets[0]);
+      return;
+    }
+    if (bucket && !visibleBuckets.includes(bucket)) goHome();
   }, [tab, counts]); // eslint-disable-line
 
   const actionsTotal = counts.filter((c) => !c.signal).reduce((a, c) => a + (c.count || 0), 0);
   const signalsTotal = counts.filter((c) => c.signal).reduce((a, c) => a + (c.count || 0), 0);
   const records = pageData.jobs || [];
+  // The landing view: Needs action with no queue opened. Signals never lands here.
+  const showLanding = tab === "actions" && !bucket;
 
   if (authed === null) return <Center>Loading…</Center>;
   if (authed === false)
@@ -438,6 +481,23 @@ export default function App() {
             <Tab active={tab === "actions"} onClick={() => setTab("actions")} label="Needs action" count={actionsTotal} />
             <Tab active={tab === "signals"} onClick={() => setTab("signals")} label="Signals" count={signalsTotal} />
           </div>
+          {/* The way home. Needs action only — Signals has no landing view. */}
+          {tab === "actions" && (
+            <>
+              <button onClick={goHome} style={{
+                width: "100%", textAlign: "left", border: `1px solid ${!bucket ? "#C7B8FF" : "transparent"}`,
+                background: !bucket ? C.purpleSoft : "transparent", borderRadius: 10, padding: "10px 12px",
+                marginBottom: 4, cursor: "pointer", display: "flex", alignItems: "center", gap: 10,
+              }}>
+                <span style={{ width: 8, height: 8, borderRadius: 8, background: C.indigo, flex: "none" }} />
+                <span style={{ flex: 1, fontSize: 13.5, fontWeight: !bucket ? 600 : 500 }}>Important now</span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: !bucket ? C.indigo : C.muted }}>
+                  {important ? important.length : "…"}
+                </span>
+              </button>
+              <div style={{ height: 1, background: C.border, margin: "8px 4px 10px" }} />
+            </>
+          )}
           {visibleBuckets.map((b) => (
             <button key={b} onClick={() => selectBucket(b)} style={{
               width: "100%", textAlign: "left", border: `1px solid ${bucket === b ? "#A2C8FE" : "transparent"}`,
@@ -460,29 +520,43 @@ export default function App() {
         </div>
 
         <div style={{ padding: "22px 28px" }}>
-          {tab === "actions" && <ImportantNow items={important} onPick={selectBucket} />}
-          <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
-            <h1 style={{ fontSize: 20, margin: 0 }}>{bucket ? (labelByBucket[bucket] || bucket) : "—"}</h1>
-            <span style={{ color: C.muted, fontSize: 13 }}>
-              {pageData.total > 0
-                ? `Showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, pageData.total)} of ${pageData.total} · live, newest first`
-                : "No open items"}
-            </span>
-          </div>
+          {showLanding ? (
+            <ImportantNow
+              items={important} busy={importantBusy} error={importantError} at={importantAt}
+              onPick={selectBucket} onRetry={() => refreshImportant()}
+            />
+          ) : (
+            <>
+              {tab === "actions" && (
+                <button onClick={goHome} title="Back to Important now"
+                  style={{ ...btn(false), padding: "5px 11px", fontSize: 12.5, color: C.muted, marginBottom: 12 }}>
+                  ← Important now
+                </button>
+              )}
+              <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
+                <h1 style={{ fontSize: 20, margin: 0 }}>{bucket ? (labelByBucket[bucket] || bucket) : "—"}</h1>
+                <span style={{ color: C.muted, fontSize: 13 }}>
+                  {pageData.total > 0
+                    ? `Showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, pageData.total)} of ${pageData.total} · live, newest first`
+                    : "No open items"}
+                </span>
+              </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 12, maxWidth: 900, opacity: loadingPage ? 0.55 : 1 }}>
-            {records.map((r) => (
-              <Card key={r.external_id} r={decorateFinding(r)} acting={actingId === r.external_id} onAction={(a) => takeAction(r, a)} />
-            ))}
-            {!loadingPage && !records.length && <p style={{ color: C.muted }}>Nothing open in this bucket.</p>}
-          </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 12, maxWidth: 900, opacity: loadingPage ? 0.55 : 1 }}>
+                {records.map((r) => (
+                  <Card key={r.external_id} r={decorateFinding(r)} acting={actingId === r.external_id} onAction={(a) => takeAction(r, a)} />
+                ))}
+                {!loadingPage && !records.length && <p style={{ color: C.muted }}>Nothing open in this bucket.</p>}
+              </div>
 
-          {pageData.totalPages > 1 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18, maxWidth: 900, justifyContent: "center" }}>
-              <button style={pbtn(page <= 1)} disabled={page <= 1} onClick={() => gotoPage(page - 1)}>← Prev</button>
-              <span style={{ fontSize: 13, color: C.muted }}>Page {page} of {pageData.totalPages}</span>
-              <button style={pbtn(page >= pageData.totalPages)} disabled={page >= pageData.totalPages} onClick={() => gotoPage(page + 1)}>Next →</button>
-            </div>
+              {pageData.totalPages > 1 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18, maxWidth: 900, justifyContent: "center" }}>
+                  <button style={pbtn(page <= 1)} disabled={page <= 1} onClick={() => gotoPage(page - 1)}>← Prev</button>
+                  <span style={{ fontSize: 13, color: C.muted }}>Page {page} of {pageData.totalPages}</span>
+                  <button style={pbtn(page >= pageData.totalPages)} disabled={page >= pageData.totalPages} onClick={() => gotoPage(page + 1)}>Next →</button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -705,47 +779,183 @@ function renderMd(text) {
 }
 
 /**
- * The few things across every action bucket that most deserve the FM's next hour,
- * ranked server-side. Each chip is a signal that actually fired for that record —
- * never filler — so the ordering can always be read back as its reasons. Renders
- * nothing at all when triage is empty or failed; it must never block the feed.
+ * The console's landing page: the few things across every action bucket that most
+ * deserve the FM's next hour, ranked server-side. Each chip is a signal that
+ * actually fired for that record — never filler — so the ordering can always be
+ * read back as its reasons.
+ *
+ * This used to be a six-row strip above a queue's card list. It is now the whole
+ * pane, which means it can no longer render nothing: `items === null` is "still
+ * ranking", `[]` is a real answer, and a failed read says so and offers a retry.
  */
-function ImportantNow({ items, onPick }) {
-  if (!items || !items.length) return null;
+function ImportantNow({ items, busy, error, at, onPick, onRetry }) {
+  const loading = items === null;
+  const list = items || [];
+  const queues = new Set(list.map((it) => it.bucket)).size;
   return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8 }}>
-        <h2 style={{ fontSize: 13, margin: 0, letterSpacing: 0.3, textTransform: "uppercase", color: C.indigo }}>Important now</h2>
-        <span style={{ fontSize: 12, color: C.muted }}>across every queue · most pressing first</span>
+    <section style={{ maxWidth: 1040 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 3 }}>
+        <h1 style={{ fontSize: 20, margin: 0 }}>Important now</h1>
+        <span style={{ color: C.muted, fontSize: 13 }}>
+          {loading
+            ? "ranking every queue…"
+            : list.length
+              ? `Top ${list.length} across ${queues} queue${queues === 1 ? "" : "s"} · most pressing first`
+              : "Nothing ranked"}
+        </span>
+        <span style={{ flex: 1 }} />
+        {at && !loading && <span style={{ fontSize: 12, color: C.muted }}>ranked {fmt(at)}</span>}
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 900 }}>
-        {items.map((it, i) => (
-          <button
-            key={it.external_id}
-            onClick={() => onPick(it.bucket)}
-            title={`Go to ${it.bucket_label}`}
-            style={{
-              display: "flex", alignItems: "center", gap: 12, width: "100%", textAlign: "left",
-              background: C.card, border: `1px solid ${C.border}`, borderRadius: 10,
-              padding: "9px 14px", cursor: "pointer", font: "inherit", color: C.ink,
-            }}
-          >
-            <span style={{ fontSize: 12, fontWeight: 700, color: C.muted, width: 16, flex: "none" }}>{i + 1}</span>
-            <span style={{ fontSize: 12.5, fontWeight: 700, color: C.muted, width: 78, flex: "none" }}>{it.ref}</span>
-            <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {it.title}
-            </span>
-            <span style={{ display: "flex", gap: 5, flex: "none", flexWrap: "wrap", justifyContent: "flex-end" }}>
-              {it.why.slice(0, 3).map((w, j) => (
-                <Pill key={j} bg={C.blueSoft} fg={C.blue}>{w}</Pill>
-              ))}
-            </span>
-            <span style={{ fontSize: 11.5, color: C.muted, width: 108, flex: "none", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {it.bucket_label}
-            </span>
+      <p style={{ margin: "0 0 16px", fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+        Ranked on signals that actually fired — how long it has waited, how close a permit is to its
+        start date, hazard wording, tenant recharge. Open a record, or jump to its whole queue.
+      </p>
+
+      {error && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, background: C.redSoft, border: "1px solid #F3C9C9", color: "#8E1313", borderRadius: 10, padding: "11px 14px", fontSize: 13, marginBottom: 14 }}>
+          <span style={{ flex: 1 }}>
+            {list.length ? "Couldn't re-rank just now — showing the last ranking." : "Couldn't rank the queues."}{" "}
+            <span style={{ opacity: 0.75 }}>{error}</span>
+          </span>
+          <button style={{ ...btn(false), padding: "5px 11px", fontSize: 12 }} disabled={busy} onClick={onRetry}>
+            {busy ? "Retrying…" : "Retry"}
           </button>
+        </div>
+      )}
+
+      {loading && <p style={{ color: C.muted, fontSize: 13.5 }}>Reading every action queue and ranking what's open…</p>}
+
+      {!loading && !list.length && !error && (
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "30px 24px", textAlign: "center" }}>
+          <div style={{ fontSize: 15.5, fontWeight: 600, marginBottom: 6 }}>Nothing urgent right now</div>
+          <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, maxWidth: 460, margin: "0 auto" }}>
+            Nothing open has waited long enough, sits close enough to its start date, or reads urgent
+            enough to jump the queue. Pick a queue on the left to work through the rest.
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, opacity: busy && list.length ? 0.55 : 1 }}>
+        {list.map((it, i) => (
+          <ImportantRow key={it.external_id} it={it} rank={i + 1} onPick={onPick} />
         ))}
       </div>
+
+      {!!list.length && (
+        <p style={{ marginTop: 16, fontSize: 12.5, color: C.muted }}>
+          This is the top of every action queue, not all of it — pick a queue on the left to see everything in it.
+        </p>
+      )}
+    </section>
+  );
+}
+
+// Tone name -> the app's shared tone styling, so the strip can never drift from
+// the card list's colour language.
+const TONE_HEX = { red: C.red, amber: C.amber, purple: C.purple, blue: C.blue };
+const toneOf = (name) => toneStyle(TONE_HEX[name] || C.blue);
+const TONE_RANK = { blue: 0, purple: 1, amber: 2, red: 3 };
+const worstTone = (names) => names.reduce((a, b) => ((TONE_RANK[b] || 0) > (TONE_RANK[a] || 0) ? b : a), "blue");
+
+/**
+ * Fallback for a browser running ahead of the deployed triage build, which sends
+ * `why` but not yet `why_tones`. Mirrors the labels triage.js emits so every chip
+ * stays meaningfully coloured either way; the server hint always wins when present.
+ */
+function guessTone(reason) {
+  const s = String(reason || "").toLowerCase();
+  if (s.startsWith("waiting")) {
+    // "Waiting 3d" (>=48h) red, "Waiting 9h" amber, "Waiting 4h" blue — the same
+    // thresholds score() uses, since ageLabel() switches to days only past 48h.
+    const m = s.match(/(\d+)\s*([hd])/);
+    if (!m) return "amber";
+    if (m[2] === "d") return "red";
+    return Number(m[1]) >= 8 ? "amber" : "blue";
+  }
+  if (s.indexOf("passed") >= 0 || s.indexOf("within 24h") >= 0) return "red";
+  if (s.indexOf("starts in") >= 0) return "amber";
+  if (s.indexOf("recharge") >= 0 || s.indexOf("quote") >= 0) return "purple";
+  if (s.indexOf("tenant") >= 0 || s.indexOf("just raised") >= 0) return "blue";
+  return "red"; // everything left is a hazard label (Fire risk, Leak, Electrical, …)
+}
+
+/**
+ * One ranked row. Deliberately a plain <div> rather than the single big <button>
+ * this used to be: a button cannot legally contain the View button, and a nested
+ * control is unreachable by keyboard. Instead the row carries the click, and the
+ * "Open queue" control inside it is a real focusable button with no handler of its
+ * own — a click on it (mouse, or Enter/Space when focused) bubbles up to the row,
+ * so the queue is selected exactly once however it was activated.
+ *
+ * As a full page rather than a header strip the row can afford three lines, so
+ * every reason chip is shown instead of three plus a "+N" the FM has to hover.
+ */
+function ImportantRow({ it, rank, onPick }) {
+  const chips = (it.why || []).map((w, j) => ({ text: w, tone: (it.why_tones || [])[j] || guessTone(w) }));
+  const tone = toneOf(it.tone || worstTone(chips.map((c) => c.tone)));
+  const caption = [it.site, it.tenant].filter(Boolean).join(" · ");
+  return (
+    <div
+      onClick={() => onPick(it.bucket)}
+      style={{
+        display: "flex", alignItems: "flex-start", gap: 12, color: C.ink, cursor: "pointer",
+        background: C.card, border: `1px solid ${C.border}`, borderLeft: `4px solid ${tone.bar}`,
+        borderRadius: 12, padding: "13px 14px 13px 15px", boxShadow: "0 1px 2px rgba(16,42,80,.04)",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          flex: "none", width: 24, height: 24, borderRadius: 24, background: tone.bg, color: tone.fg,
+          fontSize: 12, fontWeight: 700, display: "grid", placeItems: "center", marginTop: 1,
+        }}
+      >{rank}</span>
+
+      <span style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+        <span style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0 }}>
+          <span style={{ flex: "none", fontSize: 12.5, fontWeight: 700, color: C.muted, letterSpacing: 0.2 }}>{it.ref}</span>
+          {/* title= so a truncated subject is still readable on hover */}
+          <span title={it.title} style={{ minWidth: 0, fontSize: 15, fontWeight: 600, lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {it.title}
+          </span>
+        </span>
+        {/* The queue's own dot, so a row reads back to the rail entry it belongs to. */}
+        <span title={[it.bucket_label, caption].filter(Boolean).join(" · ")} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.muted, lineHeight: 1.3, minWidth: 0 }}>
+          <span style={{ flex: "none", width: 7, height: 7, borderRadius: 7, background: DOT[it.bucket] || C.blue }} />
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {[it.bucket_label, caption].filter(Boolean).join(" · ")}
+          </span>
+        </span>
+        <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginTop: 1 }}>
+          {chips.map((c, j) => {
+            const s = toneOf(c.tone);
+            return <Pill key={j} bg={s.bg} fg={s.fg}>{c.text}</Pill>;
+          })}
+        </span>
+      </span>
+
+      {/* No onClick: the click bubbles to the row. See the component note above. */}
+      <button
+        type="button"
+        aria-label={`Open queue ${it.bucket_label}`}
+        title={`Open queue · ${it.bucket_label}`}
+        style={{ ...btn(false), flex: "none", padding: "6px 11px", fontSize: 12, color: C.muted, whiteSpace: "nowrap" }}
+      >
+        Open queue →
+      </button>
+      {/* Rendered only when triage resolved a summary page for this record — a
+          View that goes nowhere is worse than no View at all. stopPropagation
+          keeps opening the record from also switching the queue underneath it. */}
+      {it.record_url && (
+        <button
+          type="button"
+          title={`Open ${it.ref} in Facilio`}
+          onClick={(e) => { e.stopPropagation(); window.open(it.record_url, "_blank", "noopener"); }}
+          style={{ ...btn(false), flex: "none", padding: "6px 13px", fontSize: 12, whiteSpace: "nowrap" }}
+        >
+          View
+        </button>
+      )}
     </div>
   );
 }
@@ -777,7 +987,10 @@ function Card({ r, acting, onAction }) {
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "space-between", alignSelf: "stretch", gap: 12, flex: "none" }}>
         <span style={{ fontSize: 12.5, fontWeight: 600, color: age.color, whiteSpace: "nowrap" }}>{age.label}</span>
         <div style={{ display: "flex", gap: 8 }}>
-          {(r.actions || []).map((a, i) => (
+          {/* The server already omits View when the record has no summary page;
+              this drops any that slip through (e.g. a stale cached feed) so a
+              dead button is never rendered. */}
+          {(r.actions || []).filter((a) => a.act !== "open" || r.record_url).map((a, i) => (
             <button key={i} disabled={acting} onClick={() => onAction(a)}
               style={{ ...btn(a.kind === "primary"), padding: "8px 16px", opacity: acting ? 0.6 : 1, whiteSpace: "nowrap" }}>
               {acting && a.kind === "primary" ? "…" : a.label}

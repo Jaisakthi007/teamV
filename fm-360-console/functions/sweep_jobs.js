@@ -85,7 +85,25 @@ function hoursSince(iso) {
   return isNaN(ms) ? null : ms / 3600000;
 }
 
-const recUrl = (mod, id) => `https://app.facilio.com/maintenance/goto/summary/${mod}/${id}`;
+/* Record deep link. The web app's only generic resolver route is
+   /:app/goto/summary/:moduleName/:id, and it matches moduleName EXACTLY against
+   the route table — the route registers `serviceRequest`, so the lowercase
+   `servicerequest` this used to emit resolved to pagenotfound. Modules with no
+   OVERVIEW route (e.g. `finding`) get "" so callers can omit the View button.
+   See feed.js for the full evidence note. */
+const LINKABLE_MODULES = {
+  servicerequest: "serviceRequest",
+  serviceRequest: "serviceRequest",
+  workorder: "workorder",
+  workpermit: "workpermit",
+  purchaseorder: "purchaseorder",
+  quote: "quote",
+};
+const recUrl = (mod, id) => {
+  const canonical = LINKABLE_MODULES[String(mod || "")];
+  if (!canonical || id == null || id === "" || String(id) === "0") return "";
+  return `https://app.facilio.com/maintenance/goto/summary/${canonical}/${id}`;
+};
 const money = (n) => (n == null || isNaN(Number(n)) ? "" : Number(n).toLocaleString());
 
 /* --------------------------------------------------------- org constants */

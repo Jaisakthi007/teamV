@@ -87,6 +87,19 @@ function hazardOf(text) {
 }
 
 /**
+ * Presentation hint only. The UI colours each reason chip, and the row's urgency
+ * bar, from these — so the meaning of a chip is decided next to the rule that
+ * fired it rather than re-derived by string-matching in the browser.
+ * Vocabulary is deliberately tiny: red | amber | purple | blue.
+ */
+const TONE_RANK = { blue: 0, purple: 1, amber: 2, red: 3 };
+function worstTone(tones) {
+  let out = "blue";
+  for (const t of tones || []) if ((TONE_RANK[t] || 0) > TONE_RANK[out]) out = t;
+  return out;
+}
+
+/**
  * Score one candidate. Every point added must also add its own reason chip, so a
  * ranking can always be read back to the FM as the reasons that actually fired.
  *
@@ -97,33 +110,58 @@ function hazardOf(text) {
 function score(item) {
   let n = 0;
   const why = [];
+  const tones = [];
+  // One call site per signal keeps points, label and colour impossible to
+  // desync — `why[i]` and `why_tones[i]` are written together or not at all.
+  const add = (points, label, tone) => { n += points; why.push(label); tones.push(tone); };
 
   const age = hoursSince(item.created_time);
   if (age != null) {
-    if (age >= 48) { n += 40; why.push(ageLabel(age)); }
-    else if (age >= 24) { n += 30; why.push(ageLabel(age)); }
-    else if (age >= 8) { n += 18; why.push(ageLabel(age)); }
-    else if (age >= 4) { n += 8; why.push(ageLabel(age)); }
+    if (age >= 48) add(40, ageLabel(age), "red");
+    else if (age >= 24) add(30, ageLabel(age), "amber");
+    else if (age >= 8) add(18, ageLabel(age), "amber");
+    else if (age >= 4) add(8, ageLabel(age), "blue");
   }
 
   // A permit whose window opens imminently blocks a crew that is already booked.
   if (item.valid_from) {
     const until = hoursUntil(item.valid_from);
     if (until != null) {
-      if (until < 0) { n += 50; why.push("Start date passed"); }
-      else if (until <= 24) { n += 45; why.push("Starts within 24h"); }
-      else if (until <= 72) { n += 20; why.push("Starts in " + Math.round(until / 24) + "d"); }
+      if (until < 0) add(50, "Start date passed", "red");
+      else if (until <= 24) add(45, "Starts within 24h", "red");
+      else if (until <= 72) add(20, "Starts in " + Math.round(until / 24) + "d", "amber");
     }
   }
 
   const hz = hazardOf(item.title);
-  if (hz) { n += 35; why.push(hz); }
+  if (hz) add(35, hz, "red");
 
-  if (item.rechargeable) { n += 15; why.push("Rechargeable to tenant"); }
-  if (item.quote_path) { n += 12; why.push("Quote path set"); }
-  if (item.tenant) { n += 6; why.push("Tenant-facing"); }
+  if (item.rechargeable) add(15, "Rechargeable to tenant", "purple");
+  if (item.quote_path) add(12, "Quote path set", "purple");
+  if (item.tenant) add(6, "Tenant-facing", "blue");
 
-  return { n, why };
+  return { n, why, tones, tone: worstTone(tones) };
+}
+
+// Record deep links. Deliberately duplicated from feed.js rather than imported
+// — this function is self-contained. See feed.js for the full evidence note:
+// the web app's only generic resolver route is /:app/goto/summary/:moduleName/:id,
+// it matches moduleName EXACTLY against the route table (so `serviceRequest`,
+// not `servicerequest`), and anything unmatched lands on pagenotfound.
+const APP_BASE_URL = "https://app.facilio.com/maintenance";
+const LINKABLE_MODULES = {
+  servicerequest: "serviceRequest",
+  serviceRequest: "serviceRequest",
+  workorder: "workorder",
+  workpermit: "workpermit",
+  purchaseorder: "purchaseorder",
+  quote: "quote",
+};
+function recordUrl(module, id) {
+  const canonical = LINKABLE_MODULES[String(module || "")];
+  if (!canonical) return "";
+  if (id == null || id === "" || String(id) === "0") return "";
+  return APP_BASE_URL + "/goto/summary/" + canonical + "/" + id;
 }
 
 const SOURCES = [
@@ -142,7 +180,7 @@ const SOURCES = [
       created_time: r.sysCreatedTime || "",
       tenant: nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant),
       site: nameOf(r.siteId),
-      record_url: "https://app.facilio.com/maintenance/tenantservices/servicerequest/all/" + r.id + "/overview?tabName=properties",
+      record_url: recordUrl("serviceRequest", r.id),
     }),
   },
   {
@@ -162,7 +200,7 @@ const SOURCES = [
       site: nameOf(r.siteId),
       rechargeable: r.tenant_rechargeable__serviceRequest === true,
       quote_path: r.tenant_quote_path_serviceRequest || "",
-      record_url: "https://app.facilio.com/maintenance/tenantservices/servicerequest/all/" + r.id + "/overview?tabName=properties",
+      record_url: recordUrl("serviceRequest", r.id),
     }),
   },
   {
@@ -176,7 +214,7 @@ const SOURCES = [
       created_time: r.sysCreatedTime || "",
       valid_from: r.expectedStartTime || "",
       site: nameOf(r.siteId),
-      record_url: "",
+      record_url: recordUrl("workpermit", r.id),
     }),
   },
 ];
@@ -202,7 +240,13 @@ server.addHandler({
         const base = src.map(r);
         const s = score(base);
         if (!s.why.length) continue; // nothing to say about it is a reason to leave it out
-        items.push({ ...base, bucket: src.bucket, bucket_label: src.label, score: s.n, why: s.why, age_h: hoursSince(base.created_time) || 0 });
+        // `why` stays a plain string[] on the wire — the UI already renders it and
+        // the two hint fields below are additive, so an older client is unaffected.
+        items.push({
+          ...base, bucket: src.bucket, bucket_label: src.label, score: s.n,
+          why: s.why, why_tones: s.tones, tone: s.tone,
+          age_h: hoursSince(base.created_time) || 0,
+        });
       }
     }
 

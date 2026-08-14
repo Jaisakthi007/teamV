@@ -56,6 +56,55 @@ async function callAction(connectionSlug, actionSlug, input) {
   return res.json();
 }
 
+// ---- record deep links -----------------------------------------------------
+// Facilio's web app registers ONE generic deep-link resolver route:
+//     /:app/goto/summary/:moduleName/:id      (component RedirctToSummary)
+// It calls findRouteForModule(moduleName, OVERVIEW) against the route table,
+// fetches the module's first view, and redirects to that record's overview
+// page; ANY failure falls through to `pagenotfound`. Verified in the live
+// production bundle (static.facilio.com/v10601/js/app.js + chunk 53245.js) and
+// matched by the backend's own URL builders — V3RecordAPI.getRecordUrl() and
+// SendTechnicianNotificationCommand.buildRecordUrl() both emit
+// <base>/<appLinkName>/goto/summary/<moduleName>/<recordId> for an arbitrary
+// module name.
+//
+// Two things the resolver is strict about:
+//  1. moduleName must be the module's CANONICAL API name, matched exactly.
+//     The route table registers `serviceRequest` — lowercase `servicerequest`
+//     is not in it and lands on pagenotfound.
+//  2. the module must actually have an OVERVIEW route. Modules with no summary
+//     page (and modules absent from the org, e.g. `finding`) can never be
+//     linked, so we return "" and the caller omits the View button entirely.
+const APP_BASE_URL = "https://app.facilio.com/maintenance";
+
+// Canonical module name (as registered with pageType OVERVIEW in the web app's
+// route table) keyed by the loose names used across this codebase.
+const LINKABLE_MODULES = {
+  servicerequest: "serviceRequest",
+  serviceRequest: "serviceRequest",
+  workorder: "workorder",
+  workpermit: "workpermit",
+  purchaseorder: "purchaseorder",
+  quote: "quote",
+  // `finding` is deliberately absent: the module does not exist in this org and
+  // has no OVERVIEW route, so no summary URL can be built for it.
+};
+
+// Build the summary URL for a record, or "" when no record page can exist.
+function recordUrl(module, id) {
+  const canonical = LINKABLE_MODULES[String(module || "")];
+  if (!canonical) return "";
+  if (id == null || id === "" || String(id) === "0") return "";
+  return APP_BASE_URL + "/goto/summary/" + canonical + "/" + id;
+}
+
+// Append the View action only when there is a real page to open — a dead
+// "View" button is worse than no button.
+const VIEW_ACTION = { label: "View", kind: "ghost", act: "open" };
+function withView(actions, url) {
+  return url ? actions.concat([VIEW_ACTION]) : actions;
+}
+
 const BUCKET_LABELS = {
   tsr: "TSR's to acknowledge", tsrack: "Acknowledged TSRs", unblock: "Unblock vendors",
   referral: "Orders awaiting referral", completion: "Orders awaiting completion",
@@ -130,6 +179,13 @@ function signalCard(r) {
     parts.push("Quoted " + metric + " vs rate card " + baseline + (pct != null ? " · " + (pct > 0 ? "+" : "") + pct + "%" : ""));
   }
   if (r.meta) parts.push(r.meta);
+  // Signals store a record_url, but rows written before the module names were
+  // canonicalised hold a stale one. Rebuild it from source_module +
+  // source_record_id whenever both are present; only fall back to the stored
+  // value when we cannot derive one. Grouped signals (e.g. SLA, which
+  // aggregates many requests per client) carry no source_record_id at all, so
+  // they correctly end up with no link and no View button.
+  const url = recordUrl(r.source_module, r.source_record_id) || (r.source_record_id == null ? String(r.record_url || "") : "");
   return {
     external_id: r.external_id, ref: r.ref || "", bucket: r.bucket,
     bucket_label: r.bucket_label || BUCKET_LABELS[r.bucket] || r.bucket,
@@ -143,12 +199,9 @@ function signalCard(r) {
     site: r.site || "", tenant: r.tenant || "", vendor: r.vendor || "", requested_by: "",
     local_id: "",
     created_time: r.detected_at || "",
-    record_url: r.record_url || "",
+    record_url: url,
     system_modified_time: r.updated_at || "",
-    actions: [
-      { label: "View", kind: "ghost", act: "open" },
-      { label: "Dismiss", kind: "ghost", act: "action" },
-    ],
+    actions: withView([], url).concat([{ label: "Dismiss", kind: "ghost", act: "action" }]),
   };
 }
 function signalBucketDef(id) {
@@ -202,15 +255,15 @@ const BUCKETS = {
         site: location, tenant, requested_by: "",
         local_id: lid ? String(lid) : "",
         created_time: r.sysCreatedTime || "",
-        record_url: "https://app.facilio.com/maintenance/tenantservices/servicerequest/all/" + id + "/overview?tabName=properties",
+        record_url: recordUrl("serviceRequest", id),
         system_modified_time: r.sysModifiedTime || "",
         // Acknowledge hands the record to the Service Request Operations team in
         // the console's agent panel, which performs the acknowledge and stays open
         // for the follow-on steps (work order, procurement, RFQ).
-        actions: [
-          { label: "Acknowledge", kind: "primary", act: "agent", prompt: "Acknowledge this tenant service request." },
-          { label: "View", kind: "ghost", act: "open" },
-        ],
+        actions: withView(
+          [{ label: "Acknowledge", kind: "primary", act: "agent", prompt: "Acknowledge this tenant service request." }],
+          recordUrl("serviceRequest", id)
+        ),
       };
     },
   },
@@ -239,10 +292,11 @@ const BUCKETS = {
       // to the Service Request Operations team in the agent panel (intent-based
       // opening), which raises the WO and stays open for procurement + RFQ.
       const woAction = { label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order", prompt: "Raise the work order for this request." };
-      const actions = [];
+      const url = recordUrl("serviceRequest", id);
+      let actions = [];
       if (qp === "Provide In-House CBRE Quote") actions.push({ label: "Create Tenant Quote", kind: "primary", act: "quote" });
       else actions.push(woAction);
-      actions.push({ label: "View", kind: "ghost", act: "open" });
+      actions = withView(actions, url);
 
       return {
         external_id: "tsrack:servicerequest:" + id, ref: "TSR-" + (lid || id),
@@ -253,7 +307,7 @@ const BUCKETS = {
         site: location, tenant, requested_by: "",
         local_id: lid ? String(lid) : "",
         created_time: r.sysCreatedTime || "",
-        record_url: "https://app.facilio.com/maintenance/tenantservices/servicerequest/all/" + id + "/overview?tabName=properties",
+        record_url: url,
         system_modified_time: r.sysModifiedTime || "",
         actions,
       };
@@ -292,17 +346,20 @@ const BUCKETS = {
           local_id: lid ? String(lid) : "",
           created_time: iso(r.sysCreatedTime),
           valid_from: iso(r.expectedStartTime), valid_to: iso(r.expectedEndTime),
-          record_url: "",
+          record_url: recordUrl("workpermit", id),
           system_modified_time: iso(r.sysModifiedTime),
           // Review with AI opens the console's agent panel on the standalone
           // Review Work Permits Studio agent (evidence first, decision only on the
           // reviewer's explicit instruction in that chat). Approve/Reject stay as
           // direct secondary actions — the agent path is additive, not a gate.
-          actions: [
-            { label: "Review with AI", kind: "primary", act: "agent", intent: "review_permit", prompt: "Review this work permit's safety checklist." },
-            { label: "Approve", kind: "ghost", act: "approve" },
-            { label: "Reject", kind: "ghost", act: "reject" },
-          ],
+          actions: withView(
+            [
+              { label: "Review with AI", kind: "primary", act: "agent", intent: "review_permit", prompt: "Review this work permit's safety checklist." },
+              { label: "Approve", kind: "ghost", act: "approve" },
+              { label: "Reject", kind: "ghost", act: "reject" },
+            ],
+            recordUrl("workpermit", id)
+          ),
         };
       });
     },
@@ -329,9 +386,9 @@ const BUCKETS = {
           meta, ai_note: "", age_label: "", status: "Referred",
           site: "", tenant: "", requested_by: "",
           local_id: "", created_time: r.sysCreatedTime || "", valid_from: "", valid_to: "",
-          record_url: "https://app.facilio.com/maintenance/goto/summary/purchaseorder/" + id,
+          record_url: recordUrl("purchaseorder", id),
           system_modified_time: r.sysModifiedTime || "",
-          actions: [{ label: "Review lines", kind: "primary", act: "drill" }, { label: "View", kind: "ghost", act: "open" }],
+          actions: withView([{ label: "Review lines", kind: "primary", act: "drill" }], recordUrl("purchaseorder", id)),
         };
       });
     },
@@ -368,7 +425,11 @@ const BUCKETS = {
           local_id: lid ? String(lid) : "",
           created_time: r.sysCreatedTime || "", valid_from: "", valid_to: "",
           description: description,   // used by the browser for Tenant/FM classification
-          record_url: "https://app.facilio.com/maintenance/goto/summary/finding/" + id,
+          // "" today: `finding` has no OVERVIEW route (and no module in this
+          // org), so no summary page exists to link to. If the module is ever
+          // added, register its canonical name in LINKABLE_MODULES and the
+          // View button reappears here with no other change.
+          record_url: recordUrl("finding", id),
           system_modified_time: r.sysModifiedTime || "",
           // The primary responsibility button (Raise Letter of Non Compliance /
           // Create Work Order) is added CLIENT-SIDE once the finding-classifier
@@ -376,10 +437,7 @@ const BUCKETS = {
           // NOTE: no add-finding-comment action exists in this org, so the `act`
           // handler's write step honestly reports syncStatus "skipped" for findings;
           // the card still leaves the feed.
-          actions: [
-            { label: "Close Finding", kind: "ghost", act: "action" },
-            { label: "View", kind: "ghost", act: "open" },
-          ],
+          actions: withView([{ label: "Close Finding", kind: "ghost", act: "action" }], recordUrl("finding", id)),
         };
       });
     },

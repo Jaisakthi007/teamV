@@ -101,6 +101,21 @@ function recordIdOf(externalId) {
  * off the live record, so the team never has to ask the FM to re-type what is
  * already recorded — and can't drift from the record's real state.
  */
+/** A lookup's record id, whether it came back as a bare number or an expanded record. */
+function idOf(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v > 0 ? v : null;
+  if (typeof v === "object" && typeof v.id === "number") return v.id > 0 ? v.id : null;
+  return null;
+}
+
+/** Thousands separators without leaning on the runtime's locale data. */
+function num(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return null;
+  const [i, f] = String(n).split(".");
+  return i.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (f ? "." + f : "");
+}
+
 /** Names out of a picklist/list payload, whatever key the module uses for the label. */
 function optionNames(resp, limit) {
   const rows = (resp && (resp.items || resp.data)) || envelope(resp).records || [];
@@ -142,6 +157,140 @@ async function workOrderOptions() {
   ].join("\n");
 }
 
+// ---- procurement policy ----------------------------------------------------
+//
+// The org's procurement thresholds are NOT in a document anywhere. Agent 6327's
+// "Procurement Policy" knowledge base (id 13, folder agent_app_procurement_policy)
+// is attached but EMPTY — asked to quote it, the agent answers KB-EMPTY — and no
+// tool returns the bands. The real numbers live as records in the custom module
+// `custom_procurementpathwaymetadata` ("Procurement Pathway Metadata"), which is
+// what the pre-raise check reads when it says "Minimum Vendor Quotes Requirements
+// are not defined for the estimated cost in the procurement activity".
+//
+// So nothing here is a hardcoded band: every number below is read live off that
+// module at briefing time. If the org has recorded none, the block says so and
+// the agent is told to ask rather than to guess.
+const PPM = "_custom_procurementpathwaymetadata";
+
+// A Site Preferred Supplier Agreement (custom_ratecard) makes its vendor
+// CONTRACTED for that site only while the agreement's contract is in one of
+// these states. Rate cards carry no status of their own — the contract does.
+// Active 143841, Hold Over 143849, Rolled Over 143852.
+const CONTRACTED_CONTRACT_STATES = [143841, 143849, 143852];
+
+/** The recorded cost bands, formatted as the agent should read them out. */
+async function thresholdLines() {
+  const resp = await tryAct("facilio-cmms", "list-custom-module-records", {
+    custom_module: "custom_procurementpathwaymetadata",
+    page_size: 200,
+    select: [
+      "id", "name", "siteId",
+      "lower_limit" + PPM, "upper_limit" + PPM,
+      "site_contracted_minimum_quotes" + PPM, "uncontracted_minimum_quotes" + PPM,
+      "procurement_pathway" + PPM, "client_group" + PPM,
+    ].join(","),
+    expand: "client_group" + PPM + ",siteId",
+  });
+  if (!resp) return null; // read failed — say "unknown", never guess
+  const lines = [];
+  for (const r of envelope(resp).records) {
+    const lo = num(r["lower_limit" + PPM]);
+    const hi = num(r["upper_limit" + PPM]);
+    const contracted = r["site_contracted_minimum_quotes" + PPM];
+    const uncontracted = r["uncontracted_minimum_quotes" + PPM];
+    const route = r["procurement_pathway" + PPM] || nameOf(r["client_group" + PPM]) || "—";
+    const siteName = nameOf(r.siteId);
+    const siteId = idOf(r.siteId);
+    const scope = siteName || (siteId ? "site #" + siteId : "all sites");
+    lines.push(
+      `• ${route} · estimated cost ${lo == null ? "—" : lo} to ${hi == null ? "—" : hi} · ${scope} ` +
+      `→ at least ${contracted == null ? "?" : contracted} quote(s) from CONTRACTED suppliers ` +
+      `and ${uncontracted == null ? "?" : uncontracted} from NON-CONTRACTED suppliers` +
+      (r.name ? `  [recorded as: ${r.name}]` : "")
+    );
+  }
+  return lines;
+}
+
+/** Suppliers under a live Site Preferred Supplier Agreement at one site. */
+async function contractedAtSite(siteId) {
+  if (!siteId) return null;
+  const resp = await tryAct("facilio-cmms", "list-custom-module-records", {
+    custom_module: "custom_ratecard",
+    page_size: 200,
+    filters: "siteId=" + siteId,
+    select: "id,name,siteId,vendor_custom_ratecard,contract_custom_ratecard,service_category_custom_ratecard",
+    expand: "vendor_custom_ratecard,contract_custom_ratecard,service_category_custom_ratecard",
+  });
+  if (!resp) return null;
+  const byVendor = new Map(); // vendor name -> Set of service categories on their agreements
+  for (const r of envelope(resp).records) {
+    const state = idOf((r.contract_custom_ratecard || {}).moduleState);
+    if (state == null || CONTRACTED_CONTRACT_STATES.indexOf(state) < 0) continue;
+    const vendor = nameOf(r.vendor_custom_ratecard);
+    if (!vendor) continue;
+    const svc = nameOf(r.service_category_custom_ratecard);
+    const seen = byVendor.get(vendor) || new Set();
+    if (svc) seen.add(svc);
+    byVendor.set(vendor, seen);
+  }
+  return byVendor;
+}
+
+/**
+ * The policy facts the procurement initiation and the RFQ both turn on, read
+ * once here instead of costing the team a lookup per turn — the same trade
+ * workOrderOptions() makes for the work-order picklists.
+ *
+ * Everything is live data. An empty or failed read prints an honest "not
+ * recorded / could not read" line so the agent asks instead of inventing.
+ */
+async function procurementContext(siteId, siteName) {
+  const [bands, contracted] = await Promise.all([thresholdLines(), contractedAtSite(siteId)]);
+  const out = ["", "=== PROCUREMENT POLICY, READ LIVE (do NOT look these up again) ==="];
+
+  out.push("Minimum quotes by estimated cost, as the organisation has actually recorded them");
+  out.push("(module 'Procurement Pathway Metadata'):");
+  if (bands == null) {
+    out.push("  Could not be read on this turn. Do NOT state or guess a number of suppliers —");
+    out.push("  say the threshold could not be read and let the pre-raise check decide it.");
+  } else if (!bands.length) {
+    out.push("  NONE RECORDED. The organisation has not recorded a single cost band. Do NOT invent one:");
+    out.push("  tell the FM plainly that no minimum-quote threshold is recorded for this cost, that it has to");
+    out.push("  be set up in the procurement thresholds, and let the pre-raise check be the authority.");
+  } else {
+    for (const b of bands) out.push("  " + b);
+    out.push("  A cost outside every band above has NO recorded requirement — say so rather than picking the");
+    out.push("  nearest band. Read the band names: a band named as a test or placeholder is not a real policy,");
+    out.push("  and you should say so when you quote it.");
+  }
+
+  if (contracted != null) {
+    out.push("");
+    out.push(
+      "Suppliers CONTRACTED at " + (siteName || "this site") +
+      " — they hold a Site Preferred Supplier Agreement whose contract is Active, Hold Over or Rolled Over:"
+    );
+    if (!contracted.size) {
+      out.push("  NONE. No supplier is contracted at this site, so every candidate is NON-CONTRACTED.");
+    } else {
+      let anyService = false;
+      for (const [vendor, services] of contracted) {
+        if (services.size) anyService = true;
+        out.push("  • " + vendor + (services.size ? " (" + Array.from(services).join(", ") + ")" : ""));
+      }
+      if (!anyService) {
+        out.push("  No service category is recorded on any of these agreements, so this list is site-wide, not");
+        out.push("  service-specific. Say that when you present it rather than implying a service match.");
+      }
+      out.push("  Any supplier NOT named above is NON-CONTRACTED for this site.");
+    }
+  }
+
+  out.push("=== END PROCUREMENT POLICY ===");
+  return out.join("\n");
+}
+
 /** Non-fatal read: an option list that fails must not sink the whole turn. */
 async function tryAct(connection, action, input) {
   try {
@@ -164,6 +313,9 @@ async function briefingFor(srId) {
   // siteId unnamed, so read the building first and fall back to whatever is set.
   const building = nameOf(sr.building_serviceRequest);
   const site = nameOf(sr.siteId) || nameOf(sr.building_serviceRequest && sr.building_serviceRequest.site);
+  // The site's record id, for the contracted-supplier read. On a service request
+  // the top-level siteId comes back null and the id sits under the building.
+  const siteId = idOf(sr.siteId) || idOf(sr.building_serviceRequest && sr.building_serviceRequest.site);
   const issue = sr.issue_location_serviceRequest || "";
   const tenant = nameOf(sr.tenant_serviceRequest_1) || nameOf(sr.tenant);
   const yesNo = (v) => (v === true ? "yes" : v === false ? "no" : "—");
@@ -194,8 +346,138 @@ async function briefingFor(srId) {
     "NOT pre-confirmed: the values above are the record's current values shown for reference. Present them as",
     "defaults or proposals and get the FM's explicit yes/changes in this chat before writing.",
   ];
-  return { sr, briefing: lines.join("\n") };
+  return { sr, siteId, site, briefing: lines.join("\n") };
 }
+
+/**
+ * Standing RFQ instruction, carried on every SR-team thread.
+ *
+ * The RFQ is raised conversationally several turns after `start`, so this can't
+ * be an opening — it has to ride in the briefing (and be re-asserted on the turn
+ * that actually asks for the RFQ, see rfqAsk()).
+ *
+ * It does NOT overrule the Create RFQ agent (Flow AI 6327); it picks the branch
+ * the agent's own procedure already offers. Verbatim from its Step 3: "AT LEAST
+ * ONE LINE IS ALWAYS REQUIRED, on every route: with none the request is refused
+ * with 'Line items cannot be empty'. When the user has not spelled the lines out,
+ * propose one sensible line from the activity's description and confirm it." We
+ * still supply a line — the refusal condition is never approached — we just stop
+ * the confirmation round-trip from blocking, and make the agent state the line it
+ * used instead. Closing date and suppliers are deliberately left as questions.
+ *
+ * Field names/values below are the real line_items shape on
+ * cbre-clone.check-rfq-details-before-raising-from-procurement-initiation:
+ * service, description, quantity, unitOfMeasure (5 = lump sum), inventoryType
+ * (3 = a service being bought in).
+ */
+const RFQ_LINE_ITEMS = [
+  "",
+  "=== STANDING INSTRUCTION — RFQ LINE ITEMS (applies whenever an RFQ is raised later in this chat) ===",
+  "When a request for quotation is raised in this conversation, do NOT ask the FM for the line items and do",
+  "NOT wait for the FM to spell them out. Take the 'propose one sensible line' route your own procedure",
+  "already allows: build ONE default line from the records already in hand and go straight on with it —",
+  "  • service: the service / service category already recorded on the procurement activity;",
+  "  • description: the work order's subject (or its short summary of the work); if neither is recorded, the",
+  "    procurement activity's own name or its description of the work. Never ask the FM to retype any of it;",
+  "  • quantity: 1;",
+  "  • how the quantity is counted (unit of measure): lump sum — the whole job priced as one sum;",
+  "  • what kind of line it is: a service being bought in.",
+  "The FM asking for the RFQ IS their confirmation of that default line. State the line you used in plain",
+  "words in your reply — service, description, quantity and how it is counted — so the FM can correct it, and",
+  "change it only if they then say so. If the FM does spell out their own lines, use theirs instead; this",
+  "default only fills the silence.",
+  "Never put a price, rate or amount on a line. What the RFQ is for is suppliers pricing it.",
+  "This changes NOTHING else about raising an RFQ. Keep asking the FM, as you always do, for the things that",
+  "cannot be defaulted and that carry real consequences — the closing date by which suppliers must return",
+  "their quote, and which suppliers to invite (the Preferred and Other vendors, or the single supplier on",
+  "single sourcing) — and keep every check you normally run, including the pre-raise check of the quotation",
+  "details.",
+  "=== END STANDING INSTRUCTION ===",
+].join("\n");
+
+/**
+ * Standing procurement-policy instruction, carried on every SR-team thread.
+ *
+ * Two behaviours the FMs asked for, neither of which the agents do today:
+ *
+ *  1. Create Procurement Initiation (Flow AI 6296) collects the estimated cost
+ *     as a sub-point of Step 3, AFTER the route is chosen — and it has NO
+ *     knowledge base and no threshold tool, so it never tells the FM what the
+ *     amount actually commits them to. This flips the order and makes it say.
+ *  2. Create RFQ (Flow AI 6327) already knows the Preferred/Other split and is
+ *     told to read a Procurement Policy knowledge base — but that KB is empty,
+ *     so the "read the policy" branch silently yields nothing. This points it at
+ *     the recorded thresholds instead, and asks for the split to be shown to the
+ *     FM rather than only used internally.
+ *
+ * It overrules neither agent. The FM's CBRE-policy-read attestation stays exactly
+ * as agent 6296 defines it, and the pre-raise check stays the final authority on
+ * the minimum — this only decides WHEN the cost is asked and WHAT is said out loud.
+ */
+const PROCUREMENT_POLICY = [
+  "",
+  "=== STANDING INSTRUCTION — PROCUREMENT POLICY (applies to the procurement initiation and the RFQ) ===",
+  "",
+  "STARTING A PROCUREMENT INITIATION — ask what the work is expected to cost FIRST.",
+  "Before the procurement route, before the buyer, before permits, before anything else, ask the FM for the",
+  "ESTIMATED COST. It is the number the whole policy turns on: how many suppliers have to quote, and who has",
+  "to approve, both follow from it, so asking it last makes the FM choose a route blind.",
+  "Once the FM gives the amount, and BEFORE you create anything, SAY WHAT THE POLICY REQUIRES AT THAT AMOUNT,",
+  "in plain words and in this order:",
+  "  • which recorded cost band the amount falls in, and what that band is called;",
+  "  • how many quotes it requires from CONTRACTED suppliers and how many from NON-CONTRACTED ones;",
+  "  • which of the three routes that points at, and why — several competing quotes means the CBRE standard",
+  "    route or the client-directed route; placing the work with one named supplier means single sourcing,",
+  "    which invites nobody to compete and so satisfies no minimum-quote requirement;",
+  "  • anything the band says about approval. If it says nothing about approval, say nothing about approval.",
+  "The bands are recorded on the 'Procurement Pathway Metadata' records (module custom_procurementpathwaymetadata:",
+  "lower limit, upper limit, procurement pathway or procurement policy, site contracted minimum quotes,",
+  "uncontracted minimum quotes). If a PROCUREMENT POLICY block appears above, those are the live records — use",
+  "them and do not look them up again. If no such block appears, read that module yourself before you answer.",
+  "If NO band covers the amount, or none is recorded at all, say exactly that: the organisation has not recorded",
+  "a minimum-quote requirement for this cost, it has to be set up in the procurement thresholds, and the",
+  "pre-raise check on the RFQ will be the one to enforce it. NEVER invent a band, a number of quotes or a",
+  "monetary limit, and never round an amount into a band it does not fall in.",
+  "Then carry on with your normal confirmation step, unchanged. In particular, the FM's confirmation that they",
+  "have READ THE CBRE STANDARD PROCUREMENT POLICY is their own personal attestation: ask it plainly, take only a",
+  "real yes, never default it to true, never infer it from silence or from their giving you the cost, and do not",
+  "create the record without it. Summarising the policy for them is NOT them having read it.",
+  "",
+  "RAISING THE RFQ — say how many suppliers are needed, and split the candidates.",
+  "Open by stating the required number of suppliers for this activity's estimated cost and route, citing the",
+  "band you read it from, exactly as above. Then present the candidate suppliers as TWO NAMED LISTS so the FM",
+  "picks knowingly rather than guessing which name is which:",
+  "  • CONTRACTED — suppliers holding a Site Preferred Supplier Agreement for this site whose contract is",
+  "    Active, Hold Over or Rolled Over. These are the Preferred (contractor) vendors, single select.",
+  "  • NON-CONTRACTED — every other eligible supplier. These are the Other vendors, multi select.",
+  "Label the two lists in those words to the FM, and say how many to pick from each. If a PROCUREMENT POLICY",
+  "block above already lists the contracted suppliers for this site, use it and do not look them up again;",
+  "otherwise build the lists with your own eligibility tools as your procedure already describes. If a list is",
+  "empty, say it is empty and say what that means for the counts — with no contracted supplier available the",
+  "requirement falls entirely on non-contracted quotes.",
+  "On single sourcing, none of this applies: exactly one named supplier, no competing suppliers, no split.",
+  "",
+  "THE PRE-RAISE CHECK REMAINS THE FINAL AUTHORITY on the minimum number of quotes. Everything you say from the",
+  "recorded bands is guidance offered up front so the FM can choose well. If the check disagrees with it, the",
+  "check wins — relay its wording, correct yourself plainly, and fix the RFQ before raising.",
+  "One more thing about the policy documents: the Procurement Policy knowledge base currently holds no",
+  "documents. If a search of it returns nothing, do NOT claim to have read a policy and do NOT reconstruct one",
+  "from memory — fall back to the recorded bands above and to the pre-raise check, and say which you used.",
+  "=== END STANDING INSTRUCTION ===",
+].join("\n");
+
+// The phrases that mean the FM is moving into procurement. The briefing carries
+// PROCUREMENT_POLICY from message one, but the initiation and the RFQ come
+// several turns later and a thread's history can be trimmed by then.
+const PROCUREMENT_ASK =
+  /\b(procurement|procure|initiate\s+procurement|start\s+(?:the\s+)?buying|bought\s+in|buy\s+(?:this|it)\s+in|source\s+(?:this|it)\s+(?:out|externally)|estimated\s+cost|single\s+sourc\w*|client[-\s]?directed)\b/i;
+
+// The phrases the SR team's own instructions list as meaning 'raise the RFQ'.
+// The briefing carries RFQ_LINE_ITEMS from the first message, but a thread's
+// history can be trimmed before the FM gets round to the RFQ several turns
+// later, so re-assert it on the turn that actually asks for one.
+const RFQ_ASK =
+  /\b(rfq|request for quotation|quotation request|out to quote|quote(?:s|d)? (?:from|by) suppliers?|suppliers? to price|price this|put this out)\b/i;
 
 /**
  * The permit briefing is deliberately minimal: the Review Work Permits agent
@@ -422,11 +704,26 @@ async function runStart(args, progress) {
     briefing = permitBriefing(recordId, args);
     title = "FM 360 Console · Permit " + recordId;
   } else {
-    const { sr, briefing: record } = await briefingFor(recordId);
+    const { sr, siteId, site, briefing: record } = await briefingFor(recordId);
     stateBefore = nameOf(sr.moduleState) || String(sr.moduleState ?? "");
     // Raising a work order needs picklists the agent would otherwise fetch one at
     // a time mid-run; acknowledging needs none of them, so only pay for them here.
-    briefing = intent === "create_work_order" ? record + (await workOrderOptions()) : record;
+    // The procurement initiation and the RFQ both follow the work order in this
+    // same thread, so the policy reads are worth paying for on the same turn —
+    // all of them in parallel, so the extra reads cost no extra wall clock.
+    briefing = record;
+    if (intent === "create_work_order") {
+      const [options, policy] = await Promise.all([
+        workOrderOptions(),
+        procurementContext(siteId, site),
+      ]);
+      briefing += options + policy;
+    }
+    // SR-team threads only. The RFQ is raised conversationally in this same thread
+    // after the work order and the procurement initiation, so the guidance has to
+    // be standing context, not an opening. It never reaches the permit agent —
+    // that intent returns above, from the other arm of this branch.
+    briefing += "\n" + RFQ_LINE_ITEMS + "\n" + PROCUREMENT_POLICY;
     title = "FM 360 Console · TSR " + recordId;
   }
 
@@ -468,7 +765,20 @@ async function runSend(args, progress) {
   const srId = intent !== "review_permit" && args && args.sr_id ? Number(args.sr_id) : null;
   const stateBefore = srId ? await stateOf(srId) : null;
 
-  const turn = await chatTurn(threadId, team, message, { srId, stateBefore, progress });
+  // Re-assert the standing guidance on the turn that actually reaches for it: the
+  // briefing carries both blocks from message one, but either can fall out of a
+  // trimmed history by the time the FM gets to procurement. SR team only —
+  // review_permit routes to a different agent whose contract this must not touch.
+  let outgoing = message;
+  if (team === DEFAULT_TEAM && intent !== "review_permit") {
+    const rfq = RFQ_ASK.test(message);
+    // The RFQ turn needs the policy too: that is where the supplier counts and
+    // the contracted/non-contracted split are actually used.
+    if (rfq) outgoing += "\n" + RFQ_LINE_ITEMS;
+    if (rfq || PROCUREMENT_ASK.test(message)) outgoing += "\n" + PROCUREMENT_POLICY;
+  }
+
+  const turn = await chatTurn(threadId, team, outgoing, { srId, stateBefore, progress });
   return { ok: true, threadId, team, ...turn, sentAt: nowIso() };
 }
 

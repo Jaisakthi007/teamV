@@ -119,7 +119,10 @@ const BUCKET_SYNC = {
         ref: "TSR-" + (r.localId && r.localId !== 0 ? r.localId : id),
         title: r.subject, priority: nameOf(r.urgency) || nameOf(r.priority) || "Normal",
         meta, status: state || "open", site, tenant, requested_by: requester,
-        record_url: "https://app.facilio.com/maintenance/goto/summary/servicerequest/" + id,
+        // Canonical module name, matched exactly by the web app's
+        // /:app/goto/summary/:moduleName/:id resolver — lowercase
+        // `servicerequest` is not in the route table and hits pagenotfound.
+        record_url: "https://app.facilio.com/maintenance/goto/summary/serviceRequest/" + id,
         system_modified_time: r.sysModifiedTime || "", raw: r,
       });
     },
