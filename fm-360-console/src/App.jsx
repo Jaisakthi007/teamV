@@ -392,6 +392,8 @@ export default function App() {
       setActingId(job.external_id);
       setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
       setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+      // On the landing view the ranked row is the card — it leaves optimistically too.
+      setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
       setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
       try {
         const res = await vibe.executeFunction("feed", "permit_decision", { external_id: job.external_id, decision: action.act, actor });
@@ -402,10 +404,12 @@ export default function App() {
         } else {
           setResult({ id: job.external_id, status: "err", text: res?.error || "Could not complete that." });
           flash(`Couldn't ${action.label.toLowerCase()}: ${res?.error || "error"}`); await loadPage(bucket, page);
+          if (!bucket) await refreshImportant({ quiet: true });
         }
       } catch (e) {
         setResult({ id: job.external_id, status: "err", text: String(e?.message || e) });
         flash(`${action.label} failed: ` + (e?.message || e)); await loadPage(bucket, page);
+        if (!bucket) await refreshImportant({ quiet: true });
       }
       finally { setActingId(null); }
       return;
@@ -413,8 +417,9 @@ export default function App() {
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
-    // optimistic: remove the card and drop the badge now
+    // optimistic: remove the card and drop the badge now (ranked row included)
     setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+    setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
     setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
     try {
       const res = await vibe.executeFunction("feed", "act", { external_id: job.external_id, action_type: action.label, actor });
@@ -428,10 +433,12 @@ export default function App() {
         setResult({ id: job.external_id, status: "err", text: res?.error || "unknown error" });
         flash(`Couldn't sync to Facilio: ${res?.error || "unknown error"}`);
         await loadPage(bucket, page); // restore
+        if (!bucket) await refreshImportant({ quiet: true });
       }
     } catch (e) {
       setResult({ id: job.external_id, status: "err", text: String(e?.message || e) });
       flash("Action failed: " + (e?.message || e)); await loadPage(bucket, page);
+      if (!bucket) await refreshImportant({ quiet: true });
     }
     finally { setActingId(null); }
   }
@@ -671,15 +678,17 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <Logo small />
-        <span className="topbar__title">FM 360 Console</span>
+        <Logo small dark />
+        <span className="topbar__title">FM 360 <em>Console</em></span>
         <LiveDot live={live} lastTick={lastTick} />
         <span className="topbar__spacer" />
         <button className="btn btn--ghost btn--sm" onClick={() => { refreshCounts(); refreshImportant(); if (bucket) loadPage(bucket, page); }}>
           Refresh
         </button>
         <div style={{
-          width: 30, height: 30, borderRadius: 8, background: "var(--brand)", color: "#fff",
+          width: 30, height: 30, borderRadius: 9, color: "#fff",
+          background: "linear-gradient(135deg, #6a58f2, #4534c4)",
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,.22)",
           display: "grid", placeItems: "center", fontSize: 12, fontWeight: 700,
         }} title={actor}>
           {(actor || "U").slice(0, 2).toUpperCase()}
@@ -1292,8 +1301,13 @@ function guessTone(reason) {
 function importantActions(it) {
   if (it.bucket === "unblock") {
     // Permits reach the ranked list only from moduleState=awaitingfmapproval.
+    // SAME verbs as the queue card, so acting here is one step — not "open the
+    // queue, then approve". Review stays for when the FM wants the evidence
+    // read to them before deciding.
     return [
-      { label: "Review permit", kind: "primary", act: "agent", intent: "review_permit",
+      { label: "Approve", kind: "primary", act: "approve" },
+      { label: "Reject", kind: "ghost", act: "reject" },
+      { label: "Review permit", kind: "ghost", act: "agent", intent: "review_permit",
         prompt: "Review this work permit and recommend whether it can be approved." },
     ];
   }
@@ -1521,9 +1535,10 @@ const SkeletonList = ({ rows = 5 }) => (
 );
 
 function LiveDot({ live, lastTick }) {
+  // Colour comes from CSS (.livedot / .livedot--off), not inline style, so the
+  // dark topbar can restyle it without !important.
   return (
-    <span className={"livedot" + (live ? "" : " livedot--off")} title={lastTick ? "Updated " + fmt(lastTick) : ""}
-      style={{ color: live ? "var(--success-ink)" : "var(--ink-3)" }}>
+    <span className={"livedot" + (live ? "" : " livedot--off")} title={lastTick ? "Updated " + fmt(lastTick) : ""}>
       <span className="livedot__d" />
       {live ? "Live" : "Paused"}
     </span>
@@ -1534,9 +1549,28 @@ const Center = ({ children }) => (
   <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "var(--canvas)", color: "var(--ink-2)" }}>{children}</div>
 );
 
-function Logo({ small }) {
-  const s = small ? 24 : 44;
-  return <div style={{ width: s, height: s, borderRadius: "50%", border: `${small ? 4 : 6}px solid var(--brand)`, display: "inline-block", flex: "none" }} />;
+/**
+ * The mark: a 300-degree gradient sweep closed by a dot — the "360" of FM 360,
+ * with the gap reading as the one thing still waiting on a human. Replaces the
+ * bare CSS ring, which read as a placeholder. `dark` adapts the track for the
+ * ink-coloured topbar.
+ */
+function Logo({ small, dark }) {
+  const s = small ? 26 : 46;
+  const grad = "fmlg-" + (dark ? "d" : "l");
+  return (
+    <svg width={s} height={s} viewBox="0 0 44 44" fill="none" aria-hidden="true" style={{ flex: "none", display: "block" }}>
+      <defs>
+        <linearGradient id={grad} x1="6" y1="4" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#8B7CFF" />
+          <stop offset="1" stopColor="#5B45E0" />
+        </linearGradient>
+      </defs>
+      <circle cx="22" cy="22" r="16" stroke={dark ? "rgba(255,255,255,.14)" : "rgba(91,69,224,.16)"} strokeWidth="5" />
+      <path d="M22 6 a16 16 0 1 1 -13.86 8" stroke={"url(#" + grad + ")"} strokeWidth="5" strokeLinecap="round" />
+      <circle cx="14" cy="8.14" r="2.6" fill="#8B7CFF" />
+    </svg>
+  );
 }
 
 function fmt(iso) {

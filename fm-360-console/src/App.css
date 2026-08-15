@@ -6,14 +6,14 @@
 
 :root {
   /* surfaces */
-  --canvas: #f7f8fa;
+  --canvas: #f6f7f9;
   --surface: #ffffff;
   --surface-2: #fbfcfd;
   --hairline: #e6e8ec;
   --hairline-strong: #d7dbe2;
 
   /* text */
-  --ink: #101317;
+  --ink: #0e1116;
   --ink-2: #5b6472;
   /* Darkened from #8a93a2 (3.1:1 on white — an AA failure at the 11–12px sizes
      this token labels). #646e7f clears 4.5:1 on every surface it sits on,
@@ -93,14 +93,20 @@ button { font-family: inherit; }
 .topbar {
   height: 56px; flex: none; display: flex; align-items: center; gap: 12px;
   padding: 0 20px;
-  /* a hair of depth so the bar reads as a surface above the canvas, without a
-     drop shadow sitting on top of another drop shadow */
-  background: linear-gradient(var(--surface), var(--surface-2));
-  border-bottom: 1px solid var(--hairline);
+  /* an ink frame above the light canvas — the app reads as an instrument, and
+     the brand gradient in the mark gets a surface it can actually sit on */
+  background: linear-gradient(180deg, #171b26, #10131b);
+  border-bottom: 1px solid #262c3c;
   position: sticky; top: 0; z-index: 20;
 }
-.topbar__title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; }
+.topbar__title { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; color: #fff; }
+.topbar__title em { font-style: normal; font-weight: 450; color: rgba(255, 255, 255, 0.55); }
 .topbar__spacer { flex: 1; }
+/* the ghost Refresh + live dot restyle for the dark frame */
+.topbar .btn--ghost { color: rgba(255, 255, 255, 0.78); }
+.topbar .btn--ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.18); color: #fff; }
+.topbar .livedot { color: #93dcb2; }
+.topbar .livedot--off { color: #98a1b3; }
 
 .cockpit {
   flex: 1; min-height: 0;
@@ -189,7 +195,8 @@ button { font-family: inherit; }
   margin-top: auto; padding: 12px 8px 4px; border-top: 1px solid var(--hairline);
   font-size: 11.5px; color: var(--ink-3); line-height: 1.7;
 }
-.livedot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.livedot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--success-ink); }
+.livedot--off { color: var(--ink-3); }
 .livedot__d { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(47, 169, 104, 0.15); }
 .livedot--off .livedot__d { background: var(--ink-3); box-shadow: none; }
 
@@ -276,8 +283,13 @@ button { font-family: inherit; }
 }
 .btn:hover:not(:disabled) { background: var(--canvas); border-color: var(--ink-3); }
 .btn:disabled { opacity: 0.5; cursor: default; }
-.btn--primary { background: var(--brand); border-color: var(--brand); color: #fff; }
-.btn--primary:hover:not(:disabled) { background: var(--brand-ink); border-color: var(--brand-ink); }
+.btn--primary {
+  background: linear-gradient(180deg, #6a58f2, #5b45e0); border-color: #4c3ad1; color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(23, 16, 66, 0.18);
+}
+.btn--primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #5f4ce8, #4d3ad0); border-color: #4534c4;
+}
 .btn--ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
 .btn--ghost:hover:not(:disabled) { background: var(--canvas); border-color: var(--hairline); color: var(--ink); }
 .btn--sm { padding: 5px 10px; font-size: 12px; min-height: 28px; }
