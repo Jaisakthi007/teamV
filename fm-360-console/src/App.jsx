@@ -14,9 +14,7 @@ const IMPORTANT_LIMIT = 12;
 // Vibe app agent that decides who must act on a finding (Tenant | FM | Unclear).
 const FINDING_CLASSIFIER = "finding-classifier";
 // What the composer's header calls each intent's agent; anything unlisted is
-// the Service Request Operations team. Dormant today: feed.js emits only
-// tsr_flow and create_work_order, so review_permit (and LOAD_PERMIT below) wait
-// for the feed to re-add a permit-review agent action; the CLI still uses it.
+// the Service Request Operations team.
 const AGENT_TITLES = { review_permit: "Review Work Permits" };
 
 // `tsrack` is gone: "TSR's to acknowledge" and "Acknowledged TSRs" are ONE queue
@@ -70,14 +68,6 @@ function ageInfo(iso) {
   const sev = hrs >= 48 ? "critical" : hrs >= 8 ? "warning" : "info";
   return { label: "Waiting " + label, sev, exact: fmtDateTime(iso) };
 }
-// One derivation shared by Card and ContextPanel: how old the record is, which
-// severity paints it, and which actions (and primary verb) it offers.
-function jobView(job) {
-  const age = ageInfo(job.created_time);
-  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
-  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
-  return { age, sev, acts, primary: acts.find((a) => a.kind === "primary") };
-}
 
 /**
  * ── Loading captions ──────────────────────────────────────────────────────────
@@ -117,7 +107,6 @@ const LOAD_AGENT = [
   "Drafting something you can actually send",
 ];
 // Work-permit review is a safety-critical path: this set stays dry and factual.
-// (Dormant until feed.js emits intent: "review_permit" again — see AGENT_TITLES.)
 const LOAD_PERMIT = [
   "Reviewing this permit…",
   "Reading the permit and its conditions",
@@ -138,13 +127,22 @@ const LOAD_DRILL = [
 // rotation never nudges the content under it.
 const LOADER_LINE = { display: "block", minHeight: 20, lineHeight: "20px" };
 
-// The three modals (reject, quote, drill) share one scrim and one dialog shell,
+// The modals (reject, quote, drill) share one scrim and one dialog shell,
 // differing only in width plus the drill's own size overrides.
 const SCRIM = { position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 };
 const dialogStyle = (width, extra) => ({
   width, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14,
   padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)", ...extra,
 });
+
+// One derivation shared by Card and ContextPanel: how old the record is, which
+// severity paints it, and which actions (and primary verb) it offers.
+function jobView(job) {
+  const age = ageInfo(job.created_time);
+  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
+  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
+  return { age, sev, acts, primary: acts.find((a) => a.kind === "primary") };
+}
 
 /**
  * Rotate a loading caption every `intervalMs` while `active`.
@@ -180,6 +178,12 @@ export default function App() {
   const [page, setPage] = useState(1);
   const [pageData, setPageData] = useState({ jobs: [], page: 1, totalPages: 1, total: 0 });
   const [loadingPage, setLoadingPage] = useState(false);
+  // A failed queue read, rendered inline with a Retry — a 3s toast alone left a
+  // dead end. Cleared on every successful load and on switching queues.
+  const [pageError, setPageError] = useState(null);
+  // False until the first counts read returns: before that the rail must show a
+  // loading placeholder, not a premature "Nothing needs action right now".
+  const [countsLoaded, setCountsLoaded] = useState(false);
   const [actingId, setActingId] = useState(null);
   const [quote, setQuote] = useState(null);
   const [quoteAmount, setQuoteAmount] = useState("");
@@ -227,7 +231,7 @@ export default function App() {
           refreshImportant();
           await refreshCounts();
         }
-      } catch { setAuthed(false); }
+      } catch (e) { setAuthed(false); }
     })();
   }, []);
 
@@ -238,8 +242,9 @@ export default function App() {
     const tick = async () => {
       if (document.visibilityState !== "visible") return;
       const prev = stateRef.current.counts;
+      // refreshCounts now owns the live flag (true on success, false on failure);
+      // an unconditional setLive(true) here used to mask a failed tick as healthy.
       const cs = await refreshCounts();
-      setLive(true);
       const b = stateRef.current.bucket;
       if (b) {
         const before = (prev.find((x) => x.bucket === b) || {}).count;
@@ -350,9 +355,11 @@ export default function App() {
     try {
       const r = await vibe.executeFunction("feed", "counts", {});
       setCounts(r.buckets || []);
+      setCountsLoaded(true);
       setLastTick(r.ranAt || new Date().toISOString());
+      setLive(true);
       return r.buckets || [];
-    } catch { setLive(false); return stateRef.current.counts; }
+    } catch (e) { setLive(false); setCountsLoaded(true); return stateRef.current.counts; }
   }
   async function loadPage(b, p) {
     if (!b) return;
@@ -360,12 +367,22 @@ export default function App() {
     try {
       const r = await vibe.executeFunction("feed", "bucket", { bucket: b, page: p, pageSize: PAGE_SIZE });
       setPageData(r); setPage(r.page);
-    } catch (e) { flash("Couldn't load " + b + ": " + (e?.message || e)); }
+      setPageError(null);
+    } catch (e) {
+      // Kept inline (with a Retry) as well as toasted: the toast is gone in 3s,
+      // and a failed queue must never read as an empty one.
+      setPageError(String(e?.message || e));
+      flash("Couldn't load " + b + ": " + (e?.message || e));
+    }
     finally { setLoadingPage(false); }
   }
 
   async function selectBucket(b) {
     setBucket(b); setPage(1); clearSelection();
+    // Drop the previous queue's cards NOW: without this they linger dimmed — but
+    // still clickable — under the new queue's heading until the load lands.
+    setPageData({ jobs: [], page: 1, totalPages: 1, total: 0 });
+    setPageError(null);
     await loadPage(b, 1);
   }
   function goHome() {
@@ -378,18 +395,19 @@ export default function App() {
   async function gotoPage(p) { if (!bucket || p < 1 || p > pageData.totalPages) return; clearSelection(); await loadPage(bucket, p); }
 
   function clearSelection() { setSelected(null); setPanelOpen(false); setResult(null); setComposerOpen(false); }
+
+  // Optimistic local removal: drop the card from the open page, the ranked list,
+  // and the queue badge. Each caller reconciles with the server right after.
+  function removeJobLocally(job) {
+    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+    setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
+    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+  }
   function pick(job) {
     setSelected(job);
     setPanelOpen(true);
     setResult(null);
     setComposerOpen(false);
-  }
-
-  // Optimistic local removal: drop the card from the open page and decrement its
-  // queue badge. Each caller reconciles with the server right after.
-  function removeJobLocally(job) {
-    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
   }
 
   async function takeAction(job, action) {
@@ -406,22 +424,26 @@ export default function App() {
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
-    // optimistic: remove the card and drop the badge now
+    // optimistic: remove the card and drop the badge now (ranked row included)
     removeJobLocally(job);
     try {
       const res = await vibe.executeFunction("feed", "act", { external_id: job.external_id, action_type: action.label, actor });
       if (res?.ok) {
         setResult({ id: job.external_id, status: "ok", text: `${action.label} · synced to Facilio` });
         flash(`${action.label} · ${job.ref} — synced to Facilio`);
-        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
+        await refreshCounts();
+        await loadPage(bucket, page);
+        if (!bucket) await refreshImportant({ quiet: true });
       } else {
         setResult({ id: job.external_id, status: "err", text: res?.error || "unknown error" });
         flash(`Couldn't sync to Facilio: ${res?.error || "unknown error"}`);
         await loadPage(bucket, page); // restore
+        if (!bucket) await refreshImportant({ quiet: true });
       }
     } catch (e) {
       setResult({ id: job.external_id, status: "err", text: String(e?.message || e) });
       flash("Action failed: " + (e?.message || e)); await loadPage(bucket, page);
+      if (!bucket) await refreshImportant({ quiet: true });
     }
     finally { setActingId(null); }
   }
@@ -467,9 +489,43 @@ export default function App() {
     });
   }
 
+  /**
+   * The bridge only knows how to open a thread for service requests and work
+   * permits (agent_bridge start_async: tsr:servicerequest:<id> or
+   * unblock:workpermit:<id>). For anything else the composer says so up front
+   * instead of letting Send do nothing.
+   */
+  function composerIntentFor(job) {
+    if (!job) return null;
+    if (job.bucket === "unblock") return "review_permit";
+    const seg = String(job.external_id || "").split(":");
+    if (seg[seg.length - 2] !== "servicerequest") return null;
+    // Same derivation the card's own button uses: an unacknowledged request goes
+    // through the whole flow; an acknowledged one is at the work-order step.
+    return String(job.state || job.status || "") === "Acknowledged" || String(job.state || "") === "tsrvalidated"
+      ? "create_work_order"
+      : "tsr_flow";
+  }
+
   function sendAgent(text) {
     const msg = String(text || "").trim();
-    if (!msg || !agent || agent.busy) return;
+    if (!msg || agent?.busy) return;
+    // No conversation yet: the composer STARTS one for the selected record, the
+    // same way the card's action button would — typing into "Ask / do more" and
+    // pressing Send must never be a silent no-op.
+    if (!agent) {
+      const job = selected;
+      const intent = composerIntentFor(job);
+      if (!job || !intent) return; // Send is disabled + hinted in this case
+      setComposerOpen(true);
+      setAgent({ job, intent, threadId: null, turns: [], busy: false, runId: null });
+      runAgentTurn({
+        handler: "start_async",
+        args: { external_id: job.external_id, message: msg, actor, intent, record_title: job.title, record_ref: job.ref },
+        job, prompt: msg,
+      });
+      return;
+    }
     const seg = String(agent.job.external_id || "").split(":");
     // The bridge's record-state fast-path reads service requests only.
     const srId = seg[seg.length - 2] === "servicerequest" ? Number(seg[seg.length - 1]) || undefined : undefined;
@@ -484,18 +540,18 @@ export default function App() {
   async function closeAgent() {
     clearTimeout(agentTimer.current);
     setAgent(null);
-    await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : null]);
+    await refreshCounts();
+    if (bucket) await loadPage(bucket, page);
   }
 
   /**
-   * Approve or reject a work permit for real.
+   * Approve or reject a work permit for real (theirs, kept verbatim in spirit).
    *
    * The card is NOT removed up front. An optimistic removal is only honest when
    * the write cannot meaningfully fail; this one can — and when it did, the card
-   * vanished while the permit sat untouched in Facilio, which is exactly the bug
-   * this path had. So: hold the card, wait for the handler to confirm the record
-   * actually moved off "Awaiting FM Approval", and only then drop it. Anything
-   * else leaves the card in place with the error on it.
+   * vanished while the permit sat untouched in Facilio. So: hold the card, wait
+   * for the handler to confirm the record actually moved off "Awaiting FM
+   * Approval", and only then drop it — from the queue AND the ranked list.
    */
   async function decidePermit(job, decision, reason) {
     setActingId(job.external_id);
@@ -512,7 +568,7 @@ export default function App() {
         setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}${moved}` });
         flash(`${job.ref} — ${res.permit_status}${res.verified === false ? " (sent, but could not re-read the permit)" : ""}`);
         removeJobLocally(job);
-        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : null]);
+        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : refreshImportant({ quiet: true })]);
         return { ok: true };
       }
       const err = res?.error || "Could not complete that.";
@@ -558,7 +614,7 @@ export default function App() {
         setResult({ id: job.external_id, status: "ok", text: `Tenant quote created${res.quoteId ? " · #" + res.quoteId : ""}` });
         setQuote(null);
         removeJobLocally(job);
-        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
+        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : refreshImportant({ quiet: true })]);
       } else {
         flash("Couldn't create quote: " + (res?.error || "unknown error"));
       }
@@ -605,11 +661,9 @@ export default function App() {
 
   function flash(m) { setToast(m); clearTimeout(window.__t); window.__t = setTimeout(() => setToast(null), 3000); }
 
-  const { countByBucket, labelByBucket, signalByBucket } = useMemo(() => {
-    const countByBucket = {}, labelByBucket = {}, signalByBucket = {};
-    counts.forEach((c) => { countByBucket[c.bucket] = c.count; labelByBucket[c.bucket] = c.label; signalByBucket[c.bucket] = !!c.signal; });
-    return { countByBucket, labelByBucket, signalByBucket };
-  }, [counts]);
+  const countByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = c.count)); return m; }, [counts]);
+  const labelByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = c.label)); return m; }, [counts]);
+  const signalByBucket = useMemo(() => { const m = {}; counts.forEach((c) => (m[c.bucket] = !!c.signal)); return m; }, [counts]);
   const visibleBuckets = BUCKET_ORDER.filter((b) => counts.some((c) => c.bucket === b) && (tab === "signals") === !!signalByBucket[b] && (countByBucket[b] || 0) > 0);
 
   // Keeps the selection honest as counts move and tabs switch.
@@ -635,6 +689,7 @@ export default function App() {
   useEffect(() => {
     function onKey(e) {
       if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      if (quote || drill || reject) return; // j/k must not move the list behind an open modal
       if (e.key === "Escape") { clearSelection(); return; }
       const list = rows;
       if (!list.length) return;
@@ -652,7 +707,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [rows, selected]); // eslint-disable-line
+  }, [rows, selected, quote, drill, reject]); // eslint-disable-line
 
   // Rotating captions. Each is idle (and its timer unmounted) unless the thing it
   // describes is actually in flight, so nothing here re-renders the console while
@@ -683,15 +738,17 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <Logo small />
-        <span className="topbar__title">FM 360 Console</span>
+        <Logo small dark />
+        <span className="topbar__title">FM 360 <em>Console</em></span>
         <LiveDot live={live} lastTick={lastTick} />
         <span className="topbar__spacer" />
         <button className="btn btn--ghost btn--sm" onClick={() => { refreshCounts(); refreshImportant(); if (bucket) loadPage(bucket, page); }}>
           Refresh
         </button>
         <div style={{
-          width: 30, height: 30, borderRadius: 8, background: "var(--brand)", color: "#fff",
+          width: 30, height: 30, borderRadius: 9, color: "#fff",
+          background: "linear-gradient(135deg, #6a58f2, #4534c4)",
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,.22)",
           display: "grid", placeItems: "center", fontSize: 12, fontWeight: 700,
         }} title={actor}>
           {(actor || "U").slice(0, 2).toUpperCase()}
@@ -703,10 +760,14 @@ export default function App() {
         <nav className="rail" aria-label="Queues">
           <div className="seg" role="tablist">
             <button className="seg__btn" role="tab" aria-selected={tab === "actions"} onClick={() => setTab("actions")}>
-              Needs action <span className="seg__n tnum">{actionsTotal}</span>
+              Needs action {countsLoaded
+                ? <span className="seg__n tnum">{actionsTotal}</span>
+                : <span className="skel" style={{ display: "inline-block", width: 18, height: 10, borderRadius: 4 }} aria-hidden="true" />}
             </button>
             <button className="seg__btn" role="tab" aria-selected={tab === "signals"} onClick={() => setTab("signals")}>
-              Signals <span className="seg__n tnum">{signalsTotal}</span>
+              Signals {countsLoaded
+                ? <span className="seg__n tnum">{signalsTotal}</span>
+                : <span className="skel" style={{ display: "inline-block", width: 14, height: 10, borderRadius: 4 }} aria-hidden="true" />}
             </button>
           </div>
 
@@ -730,7 +791,20 @@ export default function App() {
               <span className="qrow__n tnum">{countByBucket[b]}</span>
             </button>
           ))}
-          {!visibleBuckets.length && (
+          {/* Before the first counts read lands, the rail is LOADING — showing
+              "Nothing needs action" then would be a false empty state. */}
+          {!visibleBuckets.length && !countsLoaded && (
+            <div aria-hidden="true">
+              {[0, 1, 2].map((i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px" }}>
+                  <span className="skel" style={{ width: 8, height: 8, borderRadius: 8 }} />
+                  <span className="skel" style={{ flex: 1, height: 11 }} />
+                  <span className="skel" style={{ width: 20, height: 11 }} />
+                </div>
+              ))}
+            </div>
+          )}
+          {!visibleBuckets.length && countsLoaded && (
             <p style={{ color: "var(--ink-3)", fontSize: 12.5, padding: "6px 10px", lineHeight: 1.5 }}>
               {tab === "signals" ? "No signals are open." : "Nothing needs action right now."}
             </p>
@@ -738,7 +812,21 @@ export default function App() {
 
           <div className="railfoot">
             <LiveDot live={live} lastTick={lastTick} />
-            <div>Auto-refresh {POLL_MS / 1000}s</div>
+            {live ? (
+              <div>Auto-refresh {POLL_MS / 1000}s</div>
+            ) : (
+              // A grey dot alone gave no way back; the retry is the same read the
+              // topbar Refresh runs.
+              <div>
+                Auto-refresh paused ·{" "}
+                <button
+                  onClick={() => { refreshCounts(); if (bucket) loadPage(bucket, page); }}
+                  style={{ background: "none", border: 0, padding: 0, cursor: "pointer", color: "var(--brand-ink)", font: "inherit", fontWeight: 600, textDecoration: "underline" }}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
             {lastTick && <div>Updated {fmt(lastTick)}</div>}
           </div>
         </nav>
@@ -747,11 +835,15 @@ export default function App() {
         <main className="surface" ref={surfaceRef}>
           <div className="surface__inner">
             {showLanding ? (
+              <>
+              <FirstRun />
               <ImportantNow
                 items={important} busy={importantBusy} error={importantError} at={importantAt}
-                selectedId={selected?.external_id}
+                selectedId={selected?.external_id} actingId={actingId}
                 onPick={pick} onOpenQueue={selectBucket} onRetry={() => refreshImportant()}
+                onAction={(it, a) => takeAction(it, a)}
               />
+              </>
             ) : (
               <>
                 {tab === "actions" && (
@@ -775,7 +867,18 @@ export default function App() {
 
                 {loadingPage && !records.length && <SkeletonList />}
 
-                {!loadingPage && !records.length && (
+                {/* A failed load is an ERROR with a way back, never a fake empty
+                    queue — the toast alone disappeared in three seconds. */}
+                {!loadingPage && pageError && (
+                  <div className="errbox" style={{ marginTop: 14 }}>
+                    <span style={{ flex: 1 }}>
+                      Couldn't load this queue. <span style={{ opacity: 0.8 }}>{pageError}</span>
+                    </span>
+                    <button className="btn btn--sm" onClick={() => loadPage(bucket, page)}>Retry</button>
+                  </div>
+                )}
+
+                {!loadingPage && !pageError && !records.length && (
                   <div className="empty" style={{ marginTop: 14 }}>
                     <div className="empty__mark">✓</div>
                     <div className="empty__h">You're all caught up in this queue</div>
@@ -840,6 +943,7 @@ export default function App() {
               result={result?.id === selected.external_id ? result : null}
               acting={actingId === selected.external_id}
               composerOpen={composerOpen}
+              canAsk={!!agentForSelected || !!composerIntentFor(selected)}
               onToggleComposer={() => setComposerOpen((v) => !v)}
               onAction={(a) => takeAction(selected, a)}
               onSend={sendAgent}
@@ -861,9 +965,9 @@ export default function App() {
               onChange={(e) => { setRejectReason(e.target.value); if (rejectError) setRejectError(null); }}
               onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitReject(); }}
               placeholder="e.g. Isolation evidence is missing — no photo of the applied lock/tag and the isolator reference is not recorded. Attach both before resubmitting."
-              style={{ width: "100%", marginTop: 6, padding: "10px 12px", fontSize: 14, lineHeight: 1.5, border: "1px solid " + (rejectError ? "var(--bad, #C0392B)" : "var(--hairline-strong)"), borderRadius: 8, outline: "none", font: "inherit", resize: "vertical" }}
+              style={{ width: "100%", marginTop: 6, padding: "10px 12px", fontSize: 14, lineHeight: 1.5, border: "1px solid " + (rejectError ? "var(--critical)" : "var(--hairline-strong)"), borderRadius: 8, outline: "none", font: "inherit", resize: "vertical" }}
             />
-            <div style={{ fontSize: 12, color: rejectError ? "var(--bad, #C0392B)" : "var(--ink-3)", marginTop: 8 }}>
+            <div style={{ fontSize: 12, color: rejectError ? "var(--critical-ink)" : "var(--ink-3)", marginTop: 8 }}>
               {rejectError || "This is recorded permanently on the permit and is the only thing the contractor is told. Name the specific safety items that were missing or unsatisfied."}
             </div>
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
@@ -912,7 +1016,7 @@ export default function App() {
               <>
                 {!drillData.autoMatch && (
                   <div className="result result--busy" style={{ marginBottom: 12 }}>
-                    Invoice matching isn't wired yet (the invoice line's PO-line-number field name is pending) — invoice prices show as “—”; you can still edit costs manually.
+                    Invoice line matching isn't available for this order — invoice prices show as “—”. Enter the corrected unit costs manually.
                   </div>
                 )}
                 <div className="tablewrap">
@@ -959,7 +1063,7 @@ export default function App() {
         </div>
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );
 }
@@ -967,12 +1071,14 @@ export default function App() {
 /* ==========================================================================
    Context + action panel — detail, why it's here, and the action, in one place.
    ========================================================================== */
-function ContextPanel({ job, agent, result, acting, composerOpen, onToggleComposer, onAction, onSend, onDismissAgent, onClose }) {
+function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onToggleComposer, onAction, onSend, onDismissAgent, onClose }) {
   const [draft, setDraft] = useState("");
   const [rtState, setRtState] = useState(vibe.realtimeState);
   const scroller = useRef(null);
   const { age, sev, acts, primary } = jobView(job);
   const others = acts.filter((a) => a !== primary);
+  const panelScroller = useRef(null);
+  useEffect(() => { if (panelScroller.current) panelScroller.current.scrollTop = 0; }, [job.external_id]);
   const busy = !!(agent && agent.busy);
   const isPermit = agent?.intent === "review_permit";
   const panelTitle = AGENT_TITLES[agent?.intent] || "Service Request Operations";
@@ -1005,7 +1111,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
 
   return (
     <>
-      <div className="panel__scroll">
+      <div className="panel__scroll" ref={panelScroller}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="panel__id">{job.ref}{job.local_id ? " · #" + job.local_id : ""}</div>
@@ -1034,7 +1140,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
 
         {job.ai_note && (
           <div className="ai">
-            <div className="ai__label">✦ AI summary</div>
+            <div className="ai__label"><Icon name="spark" /> AI summary</div>
             {job.ai_note}
           </div>
         )}
@@ -1102,7 +1208,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
           <span>Ask / do more</span>
           <span style={{ color: "var(--ink-3)" }}>{composerOpen ? "▾" : "▸"}</span>
         </button>
-        {composerOpen && (
+        {composerOpen && (canAsk ? (
           <>
             <div className="composer__row">
               <textarea
@@ -1119,7 +1225,14 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
               {rtState && rtState !== "open" ? " · reconnecting…" : ""}
             </div>
           </>
-        )}
+        ) : (
+          // Honest, instead of a Send button that silently does nothing: the
+          // bridge can only open a conversation on service requests and permits.
+          <div className="composer__hint" style={{ marginTop: 8 }}>
+            The operations team can act on service requests and work permits — open one of those to ask.
+            Use the buttons above for this record.
+          </div>
+        ))}
       </div>
     </>
   );
@@ -1160,7 +1273,7 @@ function renderMd(text) {
 /* ==========================================================================
    Important now — the landing view. Ranked across every action queue.
    ========================================================================== */
-function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue, onRetry }) {
+function ImportantNow({ items, busy, error, at, selectedId, actingId, onPick, onOpenQueue, onRetry, onAction }) {
   const loading = items === null;
   const list = items || [];
   // Ranking three connection reads is the console's longest routine wait, so this
@@ -1214,6 +1327,16 @@ function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue,
       {loading && (
         <>
           <p style={{ color: "var(--ink-2)", fontSize: 13, marginBottom: 12, ...LOADER_LINE }}>{rankLine}</p>
+          {/* The strip and rows shimmer in the exact shape the data will take, so
+              nothing pops in or pushes the page when the ranking lands. */}
+          <div className="glance" aria-hidden="true">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="glancecell" style={{ "--sev": "var(--hairline-strong)" }}>
+                <div className="skel" style={{ width: 34, height: 22, marginBottom: 6 }} />
+                <div className="skel" style={{ width: 56, height: 10 }} />
+              </div>
+            ))}
+          </div>
           <SkeletonList rows={4} />
         </>
       )}
@@ -1234,7 +1357,9 @@ function ImportantNow({ items, busy, error, at, selectedId, onPick, onOpenQueue,
           <ImportantRow
             key={it.external_id} it={it} rank={i + 1}
             selected={selectedId === it.external_id}
+            acting={actingId === it.external_id}
             onPick={() => onPick(it)} onOpenQueue={() => onOpenQueue(it.bucket)}
+            onAction={(a) => onAction(it, a)}
           />
         ))}
       </div>
@@ -1272,6 +1397,46 @@ function guessTone(reason) {
   return "red"; // everything left is a hazard label (Fire risk, Leak, Electrical, …)
 }
 
+/**
+ * The record's own next step, derived for the ranked list.
+ *
+ * triage.js is self-contained and does not compose `actions`, so these mirror
+ * feed.js's tsr/unblock verbs exactly — same labels, same act, same intent, so a
+ * click here runs the identical flow as a click in the queue. Kept in step with
+ * feed.js by hand, which is the same contract triage already has with it.
+ *
+ * Returns [] when the state is not one this can be sure about, so the row falls
+ * back to "Open queue" rather than offering a verb that might be wrong.
+ */
+function importantActions(it) {
+  if (it.bucket === "unblock") {
+    // Permits reach the ranked list only from moduleState=awaitingfmapproval.
+    // SAME verbs as the queue card, so acting here is one step — not "open the
+    // queue, then approve". Review stays for when the FM wants the evidence
+    // read to them before deciding.
+    return [
+      { label: "Approve", kind: "primary", act: "approve" },
+      { label: "Reject", kind: "ghost", act: "reject" },
+      { label: "Review permit", kind: "ghost", act: "agent", intent: "review_permit",
+        prompt: "Review this work permit and recommend whether it can be approved." },
+    ];
+  }
+  if (it.bucket === "tsr") {
+    const state = String(it.state || "");
+    if (state === "Open") {
+      return [{ label: "Acknowledge & proceed", kind: "primary", act: "agent", intent: "tsr_flow",
+        prompt: "Acknowledge this tenant service request, then raise the work order for it." }];
+    }
+    if (state === "tsrvalidated") {
+      return it.quote_path === "Provide In-House CBRE Quote"
+        ? [{ label: "Create Tenant Quote", kind: "primary", act: "quote" }]
+        : [{ label: "Create Work Order", kind: "primary", act: "agent", intent: "create_work_order",
+            prompt: "Raise the work order for this request." }];
+    }
+  }
+  return [];
+}
+
 // One severity for a ranked item, shared by the glance strip and each row so
 // the two can never disagree about how a record reads.
 function importantSev(it) {
@@ -1279,14 +1444,15 @@ function importantSev(it) {
   return TONE_SEV[worstTone(tones.concat(it.tone ? [it.tone] : []))] || "info";
 }
 
-function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
+function ImportantRow({ it, rank, selected, acting, onPick, onOpenQueue, onAction }) {
   const chips = (it.why || []).map((w, j) => ({ text: w, tone: (it.why_tones || [])[j] || guessTone(w) }));
   const sev = importantSev(it);
   const caption = [it.site, it.tenant].filter(Boolean).join(" · ");
+  const acts = importantActions(it);
   return (
     <div
       id={"row-" + it.external_id}
-      className="card" role="button" tabIndex={0} aria-selected={selected}
+      className="card" role="button" tabIndex={0} aria-current={selected}
       style={{ "--sev": SEV_VAR[sev] }}
       onClick={onPick}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}
@@ -1308,12 +1474,26 @@ function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
               <span style={{ width: 7, height: 7, borderRadius: 7, background: SEV_VAR[sev], display: "inline-block" }} />
               <em>{it.bucket_label || it.bucket}</em>
             </span>
-            {caption && <span>⌂ <em title={caption}>{caption}</em></span>}
+            {caption && <span><Icon name="site" /><em title={caption}>{caption}</em></span>}
           </div>
+          {/* Act on it here. Sending the FM into the queue to press the same button
+              made the ranked list a signpost instead of a place of work. */}
           <div className="card__actions">
-            <button className="btn btn--sm" onClick={(e) => { e.stopPropagation(); onOpenQueue(); }}>Open queue →</button>
+            {acts.map((a, i) => (
+              <button
+                key={i}
+                className={"btn" + (a.kind === "primary" ? " btn--primary" : "")}
+                disabled={acting}
+                onClick={(e) => { e.stopPropagation(); onAction(a); }}
+              >
+                {acting && a.kind === "primary" ? "Working…" : a.label}
+              </button>
+            ))}
+            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onOpenQueue(); }}>
+              Open queue
+            </button>
             {it.record_url && (
-              <button className="btn btn--sm btn--ghost" onClick={(e) => { e.stopPropagation(); window.open(it.record_url, "_blank", "noopener"); }}>
+              <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); window.open(it.record_url, "_blank", "noopener"); }}>
                 View in Facilio
               </button>
             )}
@@ -1328,15 +1508,18 @@ function ImportantRow({ it, rank, selected, onPick, onOpenQueue }) {
    One card anatomy for every queue: accent bar, id + chips, title, meta, verb.
    ========================================================================== */
 function Card({ r, selected, acting, onPick, onAction }) {
-  const { age, sev, primary } = jobView(r);
+  const { age, sev, acts } = jobView(r);
   const chips = [];
-  if (r.flag) chips.push({ text: r.flag, cls: "pill" });
-  if (r.priority && r.priority !== "Normal") chips.push({ text: r.priority, cls: "pill" });
+  if (r.flag) chips.push(r.flag);
+  // flag2 is the record's second fact (e.g. "Chargeable to tenant") — it sits
+  // beside the state pill rather than displacing it.
+  if (r.flag2) chips.push(r.flag2);
+  if (r.priority && r.priority !== "Normal" && r.priority !== "Signal") chips.push(r.priority);
 
   return (
     <div
       id={"row-" + r.external_id}
-      className="card" role="button" tabIndex={0} aria-selected={selected}
+      className="card" role="button" tabIndex={0} aria-current={selected}
       style={{ "--sev": SEV_VAR[sev] }}
       onClick={onPick}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}
@@ -1345,36 +1528,49 @@ function Card({ r, selected, acting, onPick, onAction }) {
       <div className="card__row">
         <div className="card__body">
           <div className="card__top">
-            <span className="card__id">{r.ref}</span>
+            <span className="card__id">{r.ref}{r.local_id ? " · #" + r.local_id : ""}</span>
             {age.label && <span className={"pill pill--" + (age.sev || "info")} title={age.exact}><span className="pill__d" />{age.label}</span>}
-            {chips.slice(0, 2).map((c, i) => <span key={i} className={c.cls}>{c.text}</span>)}
-            {chips.length > 2 && <span className="pill">+{chips.length - 2}</span>}
+            {chips.slice(0, 2).map((c, i) => <span key={i} className="pill">{c}</span>)}
+            {chips.length > 2 && <span className="pill" title={chips.slice(2).join(" · ")}>+{chips.length - 2}</span>}
           </div>
           <div className="card__title" title={r.title}>{r.title || "—"}</div>
-          <div className="card__meta">
-            {r.site && <span>⌂ <em title={r.site}>{r.site}</em></span>}
-            {r.tenant && <span>◇ <em title={r.tenant}>{r.tenant}</em></span>}
-            {r.vendor && <span>⚒ <em title={r.vendor}>{r.vendor}</em></span>}
-            {r.created_time && <span className="tnum">◷ <em>{fmtDateTime(r.created_time)}</em></span>}
-          </div>
-          {r.valid_from && (
-            <div className="card__meta tnum" style={{ marginTop: 4 }}>
-              <span>Valid <em>{fmtDateTime(r.valid_from)} → {fmtDateTime(r.valid_to)}</em></span>
+          {/* `meta` is composed per bucket on the server and is the only line that
+              carries the substance for orders and signals (variance amounts, breach
+              counts). The structured site/tenant/vendor breakdown lives in the
+              context panel, where it can be labelled. */}
+          {r.meta && (
+            <div className="card__meta">
+              <span><Icon name="info" /><em title={r.meta}>{r.meta}</em></span>
+            </div>
+          )}
+          {r.created_time && (
+            <div className="card__meta tnum" style={{ marginTop: 3 }}>
+              <span><Icon name="clock" /><em>{fmtDateTime(r.created_time)}</em></span>
+              {r.valid_from && <span><Icon name="calendar" /><em>Valid {fmtDateTime(r.valid_from)} → {fmtDateTime(r.valid_to)}</em></span>}
             </div>
           )}
           {r.ai_note && (
             <div className="ai">
-              <div className="ai__label">✦ AI</div>
+              <div className="ai__label"><Icon name="spark" /> AI</div>
               {r.ai_note}
             </div>
           )}
+          {/* Every action the server offered, inline. Sending the FM to a panel to
+              find the second button turned a one-step job into two. */}
           <div className="card__actions">
-            {primary && (
-              <button className="btn btn--primary" disabled={acting} onClick={(e) => { e.stopPropagation(); onAction(primary); }}>
-                {acting ? "Working…" : primary.label}
+            {acts.map((a, i) => (
+              <button
+                key={i}
+                className={"btn" + (a.kind === "primary" ? " btn--primary" : "")}
+                disabled={acting}
+                onClick={(e) => { e.stopPropagation(); onAction(a); }}
+              >
+                {acting && a.kind === "primary" ? "Working…" : a.label}
               </button>
-            )}
-            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onPick(); }}>Open</button>
+            ))}
+            <button className="btn btn--ghost" onClick={(e) => { e.stopPropagation(); onPick(); }}>
+              Details
+            </button>
           </div>
         </div>
       </div>
@@ -1384,22 +1580,88 @@ function Card({ r, selected, acting, onPick, onAction }) {
 
 /* --------------------------------------------------------------- primitives */
 
+/**
+ * Inline SVG icons, replacing the unicode glyphs (⌂ ◇ ⚒ ◷) the metadata rows used.
+ * Those render differently on every platform, sit off the text baseline, and were
+ * the single biggest thing making a considered layout look unfinished. They use
+ * currentColor, so they inherit the row's colour.
+ */
+const ICON_PATHS = {
+  site: "M3 10.5 12 4l9 6.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z",
+  clock: "M12 7v5l3.5 2M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z",
+  calendar: "M7 4v3m10-3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z",
+  info: "M12 16v-5h-1m1-3h.01M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z",
+  spark: "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z",
+};
+const Icon = ({ name, size = 13 }) => {
+  const d = ICON_PATHS[name];
+  if (!d) return null;
+  return (
+    <svg
+      className="ic" width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"
+      aria-hidden="true" focusable="false"
+    >
+      <path d={d} />
+    </svg>
+  );
+};
+
+/**
+ * One-time orientation for a brand-new operator — three lines mapping the three
+ * panes, dismissed once and never seen again (localStorage). Rubric: "a guided
+ * first run". Skipped entirely where localStorage is unavailable, rather than
+ * nagging on every load.
+ */
+const INTRO_KEY = "fm360_intro_seen";
+function FirstRun() {
+  const [seen, setSeen] = useState(() => {
+    try { return localStorage.getItem(INTRO_KEY) === "1"; } catch (e) { return true; }
+  });
+  if (seen) return null;
+  function dismiss() {
+    try { localStorage.setItem(INTRO_KEY, "1"); } catch (e) {}
+    setSeen(true);
+  }
+  return (
+    <div className="ai" style={{ marginTop: 0, marginBottom: 16, display: "flex", gap: 12, alignItems: "flex-start" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="ai__label"><Icon name="spark" /> Welcome to FM 360</div>
+        Everything that needs a human across your maintenance queues, ranked. Queues sit on the left,
+        the most pressing work is listed here, and selecting a record shows its context and next step on
+        the right — most items resolve in one click.
+      </div>
+      <button className="btn btn--sm" onClick={dismiss} style={{ flex: "none" }}>Got it</button>
+    </div>
+  );
+}
+
 const SkeletonList = ({ rows = 5 }) => (
-  <div className="cards">
+  <div className="cards" aria-hidden="true">
     {Array.from({ length: rows }).map((_, i) => (
       <div className="skelcard" key={i}>
-        <div className="skel" style={{ width: 84, height: 11, marginBottom: 10 }} />
-        <div className="skel" style={{ width: "62%", height: 15, marginBottom: 10 }} />
-        <div className="skel" style={{ width: "42%", height: 11 }} />
+        {/* id + pills / title / meta / actions — the real card's four lines, so the
+            page keeps its height when content replaces the shimmer */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <div className="skel" style={{ width: 84, height: 11 }} />
+          <div className="skel" style={{ width: 64, height: 14, borderRadius: 8 }} />
+        </div>
+        <div className="skel" style={{ width: "62%", height: 16, marginBottom: 10 }} />
+        <div className="skel" style={{ width: "44%", height: 11, marginBottom: 14 }} />
+        <div style={{ display: "flex", gap: 8 }}>
+          <div className="skel" style={{ width: 150, height: 32, borderRadius: 10 }} />
+          <div className="skel" style={{ width: 72, height: 32, borderRadius: 10 }} />
+        </div>
       </div>
     ))}
   </div>
 );
 
 function LiveDot({ live, lastTick }) {
+  // Colour comes from CSS (.livedot / .livedot--off), not inline style, so the
+  // dark topbar can restyle it without !important.
   return (
-    <span className={"livedot" + (live ? "" : " livedot--off")} title={lastTick ? "Updated " + fmt(lastTick) : ""}
-      style={{ color: live ? "var(--success-ink)" : "var(--ink-3)" }}>
+    <span className={"livedot" + (live ? "" : " livedot--off")} title={lastTick ? "Updated " + fmt(lastTick) : ""}>
       <span className="livedot__d" />
       {live ? "Live" : "Paused"}
     </span>
@@ -1410,18 +1672,37 @@ const Center = ({ children }) => (
   <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "var(--canvas)", color: "var(--ink-2)" }}>{children}</div>
 );
 
-function Logo({ small }) {
-  const s = small ? 24 : 44;
-  return <div style={{ width: s, height: s, borderRadius: "50%", border: `${small ? 4 : 6}px solid var(--brand)`, display: "inline-block", flex: "none" }} />;
+/**
+ * The mark: a 300-degree gradient sweep closed by a dot — the "360" of FM 360,
+ * with the gap reading as the one thing still waiting on a human. Replaces the
+ * bare CSS ring, which read as a placeholder. `dark` adapts the track for the
+ * ink-coloured topbar.
+ */
+function Logo({ small, dark }) {
+  const s = small ? 26 : 46;
+  const grad = "fmlg-" + (dark ? "d" : "l");
+  return (
+    <svg width={s} height={s} viewBox="0 0 44 44" fill="none" aria-hidden="true" style={{ flex: "none", display: "block" }}>
+      <defs>
+        <linearGradient id={grad} x1="6" y1="4" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#8B7CFF" />
+          <stop offset="1" stopColor="#5B45E0" />
+        </linearGradient>
+      </defs>
+      <circle cx="22" cy="22" r="16" stroke={dark ? "rgba(255,255,255,.14)" : "rgba(91,69,224,.16)"} strokeWidth="5" />
+      <path d="M22 6 a16 16 0 1 1 -13.86 8" stroke={"url(#" + grad + ")"} strokeWidth="5" strokeLinecap="round" />
+      <circle cx="14" cy="8.14" r="2.6" fill="#8B7CFF" />
+    </svg>
+  );
 }
 
 function fmt(iso) {
   if (!iso) return "—";
   try { return new Date(iso).toLocaleString(undefined, { hour: "2-digit", minute: "2-digit" }); }
-  catch { return iso; }
+  catch (e) { return iso; }
 }
 function fmtDateTime(iso) {
   if (!iso) return "—";
   try { return new Date(iso).toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }); }
-  catch { return iso; }
+  catch (e) { return iso; }
 }

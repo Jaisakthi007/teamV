@@ -1618,16 +1618,34 @@ async function vendorMap() {
 // queues were split stays hidden instead of reappearing under its new id.
 function hiddenSet(d, bucketId, aliases) {
   const out = new Set();
+  // No try/catch: a dead job_state read used to fall back to an empty set, which
+  // silently RESURRECTED every already-actioned card as open work. Failing the
+  // bucket read is the honest outcome — counts already surfaces a per-bucket
+  // error, and the console shows an inline error with a retry.
   for (const prefix of [bucketId].concat(aliases || [])) {
-    try {
-      const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [prefix + ":%"]);
-      for (const r of rows) {
-        const eid = String(r.external_id);
-        out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
-      }
-    } catch { /* a dead read must not un-hide everything */ }
+    const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [prefix + ":%"]);
+    for (const r of rows) {
+      const eid = String(r.external_id);
+      out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
+    }
   }
   return out;
+}
+
+// True when this job was already actioned — the guard the comment/quote/PO write
+// handlers run FIRST, so a browser retry after a timeout never writes the same
+// comment/quote/update twice. Deliberately NOT used by permit_decision: permits
+// verify against the RECORD (before/after state), and job_state rows from the
+// era when permit writes silently failed would wrongly block a real decision.
+function alreadyActioned(d, externalId) {
+  try {
+    const { rows } = d.query("select action_taken, action_type from job_state where external_id = $1", [externalId]);
+    return rows.length && rows[0].action_taken === "true" ? (rows[0].action_type || "Actioned") : null;
+  } catch {
+    // If the guard itself cannot read, let the write proceed — a possible
+    // duplicate comment beats definitely losing the action.
+    return null;
+  }
 }
 // Deliberately the size of the (deduped, rewritten) set rather than its own
 // count(*): with aliases in play the same record can be recorded under two
@@ -1737,6 +1755,11 @@ server.addHandler({
     const module = seg[seg.length - 2];
     const actionType = args.action_type || "Actioned";
     const now = nowIso();
+
+    // Retry / double-submit: already actioned means already commented — succeed
+    // without writing a second comment.
+    const done = alreadyActioned(d, args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, action_type: done, syncStatus: "synced", idempotent: true };
 
     let syncStatus = "synced", syncError = null;
     try {
@@ -1955,6 +1978,12 @@ server.addHandler({
     const seg = String(args.external_id).split(":");
     const srId = Number(seg[seg.length - 1]);
 
+    // Retry / double-submit: a quote already exists for this request — creating a
+    // second one is the worst duplicate in the console, so this guard runs before
+    // anything else.
+    const done = alreadyActioned(db(), args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, amount, quoteId: null, idempotent: true };
+
     // pull the full service request to source the rest of the payload
     const resp = await callAction("facilio-cmms", "list-service-requests", {
       filters: "id=" + srId,
@@ -2053,6 +2082,11 @@ server.addHandler({
     let updates = [];
     try { updates = JSON.parse(args.updates || "[]"); } catch { throw new Error("updates must be a JSON array"); }
     if (!updates.length) throw new Error("no line updates provided");
+
+    // Retry / double-submit: the PO lines were already corrected in a previous
+    // call — re-applying would overwrite any later manual edits made in Facilio.
+    const done = alreadyActioned(db(), args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, updated: 0, idempotent: true };
 
     const lineItems = updates.map((u) => ({ id: u.lineId, unitPrice: Number(u.unitPrice) }));
     let syncStatus = "synced", syncError = null;

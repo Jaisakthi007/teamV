@@ -6,15 +6,18 @@
 
 :root {
   /* surfaces */
-  --canvas: #f7f8fa;
+  --canvas: #f6f7f9;
   --surface: #ffffff;
   --hairline: #e6e8ec;
   --hairline-strong: #d7dbe2;
 
   /* text */
-  --ink: #101317;
+  --ink: #0e1116;
   --ink-2: #5b6472;
-  --ink-3: #8a93a2;
+  /* Darkened from #8a93a2 (3.1:1 on white — an AA failure at the 11–12px sizes
+     this token labels). #646e7f clears 4.5:1 on every surface it sits on,
+     including the selected card's brand tint. */
+  --ink-3: #646e7f;
 
   /* brand — primary actions and active states only */
   --brand: #5b45e0;
@@ -66,6 +69,9 @@ body {
    so IT scrolls rather than the page. */
 .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+/* Metadata icons sit on the text baseline and inherit the row's colour. */
+.ic { flex: none; opacity: 0.65; margin-top: 1px; }
+
 /* numbers must not jitter as the feed refreshes */
 .tnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
 
@@ -95,12 +101,21 @@ button { font-family: inherit; }
 
 .topbar {
   height: 56px; flex: none; display: flex; align-items: center; gap: 12px;
-  padding: 0 20px; background: var(--surface);
-  border-bottom: 1px solid var(--hairline);
+  padding: 0 20px;
+  /* an ink frame above the light canvas — the app reads as an instrument, and
+     the brand gradient in the mark gets a surface it can actually sit on */
+  background: linear-gradient(180deg, #171b26, #10131b);
+  border-bottom: 1px solid #262c3c;
   position: sticky; top: 0; z-index: 20;
 }
-.topbar__title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; }
+.topbar__title { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; color: #fff; }
+.topbar__title em { font-style: normal; font-weight: 450; color: rgba(255, 255, 255, 0.55); }
 .topbar__spacer { flex: 1; }
+/* the ghost Refresh + live dot restyle for the dark frame */
+.topbar .btn--ghost { color: rgba(255, 255, 255, 0.78); }
+.topbar .btn--ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.18); color: #fff; }
+.topbar .livedot { color: #93dcb2; }
+.topbar .livedot--off { color: #98a1b3; }
 
 .cockpit {
   flex: 1; min-height: 0;
@@ -178,17 +193,22 @@ button { font-family: inherit; }
 }
 .qrow__dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--qc, var(--info)); }
 .qrow__label { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* the count is tinted by the queue's own severity, so the rail reads as a shape
+   of workload rather than a list of neutral numbers */
 .qrow__n {
   flex: none; min-width: 22px; text-align: center; font-size: 12px; font-weight: 600;
-  color: var(--ink-2); background: var(--canvas); border-radius: 20px; padding: 1px 7px;
+  color: var(--qc, var(--ink-2)); background: var(--canvas);
+  border-radius: 20px; padding: 1px 7px;
+  font-variant-numeric: tabular-nums;
 }
-.qrow[aria-current="true"] .qrow__n { color: var(--brand-ink); background: var(--surface); }
+.qrow[aria-current="true"] .qrow__n { background: var(--surface); }
 
 .railfoot {
   margin-top: auto; padding: 12px 8px 4px; border-top: 1px solid var(--hairline);
   font-size: 11.5px; color: var(--ink-3); line-height: 1.7;
 }
-.livedot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.livedot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--success-ink); }
+.livedot--off { color: var(--ink-3); }
 .livedot__d { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(47, 169, 104, 0.15); }
 .livedot--off .livedot__d { background: var(--ink-3); box-shadow: none; }
 
@@ -203,24 +223,35 @@ button { font-family: inherit; }
 .card {
   position: relative; width: 100%; text-align: left; cursor: pointer;
   background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: var(--radius-card); padding: 16px 18px 16px 20px;
-  overflow: hidden; transition: border-color var(--ease), box-shadow var(--ease), background var(--ease);
+  border-radius: var(--radius-card); padding: 18px 20px 18px 22px;
+  overflow: hidden;
+  transition: border-color var(--ease), box-shadow var(--ease), background var(--ease), transform var(--ease);
 }
-.card:hover { box-shadow: var(--shadow-hover); border-color: var(--hairline-strong); }
-.card[aria-selected="true"] {
+/* a small lift on hover, and a real ring when selected — enough to feel
+   responsive without the page bouncing */
+.card:hover {
+  box-shadow: 0 2px 8px rgba(16, 19, 23, 0.07), 0 1px 2px rgba(16, 19, 23, 0.04);
+  border-color: var(--hairline-strong); transform: translateY(-1px);
+}
+.card[aria-current="true"] {
   border-color: var(--brand-line); background: var(--brand-tint);
-  box-shadow: var(--shadow-hover);
+  box-shadow: 0 0 0 3px var(--brand-tint), 0 2px 10px rgba(91, 69, 224, 0.1);
 }
-.card__bar { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--sev, var(--info)); }
+/* the severity bar fades out down the card instead of a flat stripe */
+.card__bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: linear-gradient(to bottom, var(--sev, var(--info)) 0%, var(--sev, var(--info)) 55%, transparent 100%);
+}
 
 .card__top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .card__id {
-  font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-  color: var(--ink-3);
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
 .card__title {
-  font-size: 15.5px; font-weight: 600; line-height: 1.35; color: var(--ink);
-  margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 16.5px; font-weight: 600; line-height: 1.35; color: var(--ink);
+  letter-spacing: -0.012em;
+  margin-bottom: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .card__meta {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -229,7 +260,10 @@ button { font-family: inherit; }
 /* icon stays pinned to the top-left of its value, so a value that wraps onto a
    second line never orphans the glyph on a line of its own */
 .card__meta span { display: inline-flex; align-items: flex-start; gap: 5px; min-width: 0; flex-wrap: nowrap; }
-.card__meta em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30ch; min-width: 0; }
+/* no 30ch cap: `meta` is the card's main information line for orders and signals,
+   so it gets the full width and ellipsises at the card edge instead */
+.card__meta em { font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; min-width: 0; }
+.card__meta > span { max-width: 100%; }
 .card__row { display: flex; align-items: flex-start; gap: 16px; }
 .card__body { flex: 1; min-width: 0; }
 .card__actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
@@ -259,8 +293,13 @@ button { font-family: inherit; }
 }
 .btn:hover:not(:disabled) { background: var(--canvas); border-color: var(--ink-3); }
 .btn:disabled { opacity: 0.5; cursor: default; }
-.btn--primary { background: var(--brand); border-color: var(--brand); color: #fff; }
-.btn--primary:hover:not(:disabled) { background: var(--brand-ink); border-color: var(--brand-ink); }
+.btn--primary {
+  background: linear-gradient(180deg, #6a58f2, #5b45e0); border-color: #4c3ad1; color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(23, 16, 66, 0.18);
+}
+.btn--primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #5f4ce8, #4d3ad0); border-color: #4534c4;
+}
 .btn--ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
 .btn--ghost:hover:not(:disabled) { background: var(--canvas); border-color: var(--hairline); color: var(--ink); }
 .btn--sm { padding: 5px 10px; font-size: 12px; min-height: 28px; }
@@ -363,7 +402,17 @@ button { font-family: inherit; }
 }
 .skelcard {
   background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: var(--radius-card); padding: 16px 18px 16px 20px;
+  border-radius: var(--radius-card); padding: 18px 20px 18px 22px;
+}
+
+/* Content that replaces shimmer fades up once on mount. Keys are stable across
+   the 30s poll, so a re-rank does NOT re-animate — only genuinely new rows do.
+   Off under prefers-reduced-motion, along with the shimmer itself. */
+@keyframes fadeup { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.cards > .card, .glancecell { animation: fadeup 180ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .cards > .card, .glancecell { animation: none; }
+  .skel { animation: none; }
 }
 
 /* ------------------------------------------------------------ glance strip */
@@ -455,7 +504,10 @@ kbd {
   .card__title { white-space: normal; }
   /* a long tenant or vendor name must wrap, not push the card sideways */
   .card__meta em { max-width: 100%; white-space: normal; }
+  /* real verbs share the row; the ghost "Details" stays its own size rather than
+     stretching across a line of its own */
   .card__actions .btn { flex: 1 1 auto; }
+  .card__actions .btn--ghost { flex: 0 0 auto; }
 
   /* WCAG-comfortable tap targets */
   .btn { min-height: 44px; padding: 10px 16px; }

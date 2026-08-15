@@ -186,6 +186,11 @@ const SOURCES = [
       created_time: r.sysCreatedTime || "",
       tenant: nameOf(r.tenant_serviceRequest_1) || nameOf(r.tenant),
       site: nameOf(r.siteId),
+      // moduleState was already read; passing it lets the ranked list offer the
+      // record's OWN next step ("Acknowledge & proceed" vs "Create Work Order")
+      // instead of only a link into the queue. Inferring it from `rechargeable`
+      // would be wrong: that is false both when unset and when explicitly false.
+      state: nameOf(r.moduleState) || String(r.moduleState || ""),
       // Only acknowledged requests carry these, so they score only where they are
       // real — an unacknowledged row simply has nothing to say on either.
       rechargeable: r.tenant_rechargeable__serviceRequest === true,
