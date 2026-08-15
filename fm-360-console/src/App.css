@@ -402,7 +402,17 @@ button { font-family: inherit; }
 }
 .skelcard {
   background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: var(--radius-card); padding: 16px 18px 16px 20px;
+  border-radius: var(--radius-card); padding: 18px 20px 18px 22px;
+}
+
+/* Content that replaces shimmer fades up once on mount. Keys are stable across
+   the 30s poll, so a re-rank does NOT re-animate — only genuinely new rows do.
+   Off under prefers-reduced-motion, along with the shimmer itself. */
+@keyframes fadeup { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.cards > .card, .glancecell { animation: fadeup 180ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .cards > .card, .glancecell { animation: none; }
+  .skel { animation: none; }
 }
 
 /* ------------------------------------------------------------ glance strip */

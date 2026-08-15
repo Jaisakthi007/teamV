@@ -760,10 +760,14 @@ export default function App() {
         <nav className="rail" aria-label="Queues">
           <div className="seg" role="tablist">
             <button className="seg__btn" role="tab" aria-selected={tab === "actions"} onClick={() => setTab("actions")}>
-              Needs action <span className="seg__n tnum">{actionsTotal}</span>
+              Needs action {countsLoaded
+                ? <span className="seg__n tnum">{actionsTotal}</span>
+                : <span className="skel" style={{ display: "inline-block", width: 18, height: 10, borderRadius: 4 }} aria-hidden="true" />}
             </button>
             <button className="seg__btn" role="tab" aria-selected={tab === "signals"} onClick={() => setTab("signals")}>
-              Signals <span className="seg__n tnum">{signalsTotal}</span>
+              Signals {countsLoaded
+                ? <span className="seg__n tnum">{signalsTotal}</span>
+                : <span className="skel" style={{ display: "inline-block", width: 14, height: 10, borderRadius: 4 }} aria-hidden="true" />}
             </button>
           </div>
 
@@ -1321,6 +1325,16 @@ function ImportantNow({ items, busy, error, at, selectedId, actingId, onPick, on
       {loading && (
         <>
           <p style={{ color: "var(--ink-2)", fontSize: 13, marginBottom: 12, ...LOADER_LINE }}>{rankLine}</p>
+          {/* The strip and rows shimmer in the exact shape the data will take, so
+              nothing pops in or pushes the page when the ranking lands. */}
+          <div className="glance" aria-hidden="true">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="glancecell" style={{ "--sev": "var(--hairline-strong)" }}>
+                <div className="skel" style={{ width: 34, height: 22, marginBottom: 6 }} />
+                <div className="skel" style={{ width: 56, height: 10 }} />
+              </div>
+            ))}
+          </div>
           <SkeletonList rows={4} />
         </>
       )}
@@ -1621,12 +1635,21 @@ function FirstRun() {
 }
 
 const SkeletonList = ({ rows = 5 }) => (
-  <div className="cards">
+  <div className="cards" aria-hidden="true">
     {Array.from({ length: rows }).map((_, i) => (
       <div className="skelcard" key={i}>
-        <div className="skel" style={{ width: 84, height: 11, marginBottom: 10 }} />
-        <div className="skel" style={{ width: "62%", height: 15, marginBottom: 10 }} />
-        <div className="skel" style={{ width: "42%", height: 11 }} />
+        {/* id + pills / title / meta / actions — the real card's four lines, so the
+            page keeps its height when content replaces the shimmer */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <div className="skel" style={{ width: 84, height: 11 }} />
+          <div className="skel" style={{ width: 64, height: 14, borderRadius: 8 }} />
+        </div>
+        <div className="skel" style={{ width: "62%", height: 16, marginBottom: 10 }} />
+        <div className="skel" style={{ width: "44%", height: 11, marginBottom: 14 }} />
+        <div style={{ display: "flex", gap: 8 }}>
+          <div className="skel" style={{ width: 150, height: 32, borderRadius: 10 }} />
+          <div className="skel" style={{ width: 72, height: 32, borderRadius: 10 }} />
+        </div>
       </div>
     ))}
   </div>
