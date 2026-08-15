@@ -161,6 +161,12 @@ export default function App() {
   const [page, setPage] = useState(1);
   const [pageData, setPageData] = useState({ jobs: [], page: 1, totalPages: 1, total: 0 });
   const [loadingPage, setLoadingPage] = useState(false);
+  // A failed queue read, rendered inline with a Retry — a 3s toast alone left a
+  // dead end. Cleared on every successful load and on switching queues.
+  const [pageError, setPageError] = useState(null);
+  // False until the first counts read returns: before that the rail must show a
+  // loading placeholder, not a premature "Nothing needs action right now".
+  const [countsLoaded, setCountsLoaded] = useState(false);
   const [actingId, setActingId] = useState(null);
   const [quote, setQuote] = useState(null);
   const [quoteAmount, setQuoteAmount] = useState("");
@@ -215,8 +221,9 @@ export default function App() {
     const tick = async () => {
       if (document.visibilityState !== "visible") return;
       const prev = stateRef.current.counts;
+      // refreshCounts now owns the live flag (true on success, false on failure);
+      // an unconditional setLive(true) here used to mask a failed tick as healthy.
       const cs = await refreshCounts();
-      setLive(true);
       const b = stateRef.current.bucket;
       if (b) {
         const before = (prev.find((x) => x.bucket === b) || {}).count;
@@ -327,9 +334,11 @@ export default function App() {
     try {
       const r = await vibe.executeFunction("feed", "counts", {});
       setCounts(r.buckets || []);
+      setCountsLoaded(true);
       setLastTick(r.ranAt || new Date().toISOString());
+      setLive(true);
       return r.buckets || [];
-    } catch (e) { setLive(false); return stateRef.current.counts; }
+    } catch (e) { setLive(false); setCountsLoaded(true); return stateRef.current.counts; }
   }
   async function loadPage(b, p) {
     if (!b) return;
@@ -337,12 +346,22 @@ export default function App() {
     try {
       const r = await vibe.executeFunction("feed", "bucket", { bucket: b, page: p, pageSize: PAGE_SIZE });
       setPageData(r); setPage(r.page);
-    } catch (e) { flash("Couldn't load " + b + ": " + (e?.message || e)); }
+      setPageError(null);
+    } catch (e) {
+      // Kept inline (with a Retry) as well as toasted: the toast is gone in 3s,
+      // and a failed queue must never read as an empty one.
+      setPageError(String(e?.message || e));
+      flash("Couldn't load " + b + ": " + (e?.message || e));
+    }
     finally { setLoadingPage(false); }
   }
 
   async function selectBucket(b) {
     setBucket(b); setPage(1); clearSelection();
+    // Drop the previous queue's cards NOW: without this they linger dimmed — but
+    // still clickable — under the new queue's heading until the load lands.
+    setPageData({ jobs: [], page: 1, totalPages: 1, total: 0 });
+    setPageError(null);
     await loadPage(b, 1);
   }
   function goHome() {
@@ -458,9 +477,43 @@ export default function App() {
     });
   }
 
+  /**
+   * The bridge only knows how to open a thread for service requests and work
+   * permits (agent_bridge start_async: tsr:servicerequest:<id> or
+   * unblock:workpermit:<id>). For anything else the composer says so up front
+   * instead of letting Send do nothing.
+   */
+  function composerIntentFor(job) {
+    if (!job) return null;
+    if (job.bucket === "unblock") return "review_permit";
+    const seg = String(job.external_id || "").split(":");
+    if (seg[seg.length - 2] !== "servicerequest") return null;
+    // Same derivation the card's own button uses: an unacknowledged request goes
+    // through the whole flow; an acknowledged one is at the work-order step.
+    return String(job.state || job.status || "") === "Acknowledged" || String(job.state || "") === "tsrvalidated"
+      ? "create_work_order"
+      : "tsr_flow";
+  }
+
   function sendAgent(text) {
     const msg = String(text || "").trim();
-    if (!msg || !agent || agent.busy) return;
+    if (!msg || agent?.busy) return;
+    // No conversation yet: the composer STARTS one for the selected record, the
+    // same way the card's action button would — typing into "Ask / do more" and
+    // pressing Send must never be a silent no-op.
+    if (!agent) {
+      const job = selected;
+      const intent = composerIntentFor(job);
+      if (!job || !intent) return; // Send is disabled + hinted in this case
+      setComposerOpen(true);
+      setAgent({ job, intent, threadId: null, turns: [], busy: false, runId: null });
+      runAgentTurn({
+        handler: "start_async",
+        args: { external_id: job.external_id, message: msg, actor, intent, record_title: job.title, record_ref: job.ref },
+        job, prompt: msg,
+      });
+      return;
+    }
     const seg = String(agent.job.external_id || "").split(":");
     // The bridge's record-state fast-path reads service requests only.
     const srId = seg[seg.length - 2] === "servicerequest" ? Number(seg[seg.length - 1]) || undefined : undefined;
@@ -569,6 +622,7 @@ export default function App() {
   useEffect(() => {
     function onKey(e) {
       if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      if (quote || drill) return; // j/k must not move the list behind an open modal
       if (e.key === "Escape") { clearSelection(); return; }
       const list = rows;
       if (!list.length) return;
@@ -586,7 +640,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [rows, selected]); // eslint-disable-line
+  }, [rows, selected, quote, drill]); // eslint-disable-line
 
   // Rotating captions. Each is idle (and its timer unmounted) unless the thing it
   // describes is actually in flight, so nothing here re-renders the console while
@@ -664,7 +718,20 @@ export default function App() {
               <span className="qrow__n tnum">{countByBucket[b]}</span>
             </button>
           ))}
-          {!visibleBuckets.length && (
+          {/* Before the first counts read lands, the rail is LOADING — showing
+              "Nothing needs action" then would be a false empty state. */}
+          {!visibleBuckets.length && !countsLoaded && (
+            <div aria-hidden="true">
+              {[0, 1, 2].map((i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px" }}>
+                  <span className="skel" style={{ width: 8, height: 8, borderRadius: 8 }} />
+                  <span className="skel" style={{ flex: 1, height: 11 }} />
+                  <span className="skel" style={{ width: 20, height: 11 }} />
+                </div>
+              ))}
+            </div>
+          )}
+          {!visibleBuckets.length && countsLoaded && (
             <p style={{ color: "var(--ink-3)", fontSize: 12.5, padding: "6px 10px", lineHeight: 1.5 }}>
               {tab === "signals" ? "No signals are open." : "Nothing needs action right now."}
             </p>
@@ -672,7 +739,21 @@ export default function App() {
 
           <div className="railfoot">
             <LiveDot live={live} lastTick={lastTick} />
-            <div>Auto-refresh {POLL_MS / 1000}s</div>
+            {live ? (
+              <div>Auto-refresh {POLL_MS / 1000}s</div>
+            ) : (
+              // A grey dot alone gave no way back; the retry is the same read the
+              // topbar Refresh runs.
+              <div>
+                Auto-refresh paused ·{" "}
+                <button
+                  onClick={() => { refreshCounts(); if (bucket) loadPage(bucket, page); }}
+                  style={{ background: "none", border: 0, padding: 0, cursor: "pointer", color: "var(--brand-ink)", font: "inherit", fontWeight: 600, textDecoration: "underline" }}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
             {lastTick && <div>Updated {fmt(lastTick)}</div>}
           </div>
         </nav>
@@ -681,12 +762,15 @@ export default function App() {
         <main className="surface" ref={surfaceRef}>
           <div className="surface__inner">
             {showLanding ? (
+              <>
+              <FirstRun />
               <ImportantNow
                 items={important} busy={importantBusy} error={importantError} at={importantAt}
                 selectedId={selected?.external_id} actingId={actingId}
                 onPick={pick} onOpenQueue={selectBucket} onRetry={() => refreshImportant()}
                 onAction={(it, a) => takeAction(it, a)}
               />
+              </>
             ) : (
               <>
                 {tab === "actions" && (
@@ -710,7 +794,18 @@ export default function App() {
 
                 {loadingPage && !records.length && <SkeletonList />}
 
-                {!loadingPage && !records.length && (
+                {/* A failed load is an ERROR with a way back, never a fake empty
+                    queue — the toast alone disappeared in three seconds. */}
+                {!loadingPage && pageError && (
+                  <div className="errbox" style={{ marginTop: 14 }}>
+                    <span style={{ flex: 1 }}>
+                      Couldn't load this queue. <span style={{ opacity: 0.8 }}>{pageError}</span>
+                    </span>
+                    <button className="btn btn--sm" onClick={() => loadPage(bucket, page)}>Retry</button>
+                  </div>
+                )}
+
+                {!loadingPage && !pageError && !records.length && (
                   <div className="empty" style={{ marginTop: 14 }}>
                     <div className="empty__mark">✓</div>
                     <div className="empty__h">You're all caught up in this queue</div>
@@ -775,6 +870,7 @@ export default function App() {
               result={result?.id === selected.external_id ? result : null}
               acting={actingId === selected.external_id}
               composerOpen={composerOpen}
+              canAsk={!!agentForSelected || !!composerIntentFor(selected)}
               onToggleComposer={() => setComposerOpen((v) => !v)}
               onAction={(a) => takeAction(selected, a)}
               onSend={sendAgent}
@@ -823,7 +919,7 @@ export default function App() {
               <>
                 {!drillData.autoMatch && (
                   <div className="result result--busy" style={{ marginBottom: 12 }}>
-                    Invoice matching isn't wired yet (the invoice line's PO-line-number field name is pending) — invoice prices show as “—”; you can still edit costs manually.
+                    Invoice line matching isn't available for this order — invoice prices show as “—”. Enter the corrected unit costs manually.
                   </div>
                 )}
                 <div className="tablewrap">
@@ -870,7 +966,7 @@ export default function App() {
         </div>
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );
 }
@@ -878,7 +974,7 @@ export default function App() {
 /* ==========================================================================
    Context + action panel — detail, why it's here, and the action, in one place.
    ========================================================================== */
-function ContextPanel({ job, agent, result, acting, composerOpen, onToggleComposer, onAction, onSend, onDismissAgent, onClose }) {
+function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onToggleComposer, onAction, onSend, onDismissAgent, onClose }) {
   const [draft, setDraft] = useState("");
   const [rtState, setRtState] = useState(vibe.realtimeState);
   const scroller = useRef(null);
@@ -998,7 +1094,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
           <span>Ask / do more</span>
           <span style={{ color: "var(--ink-3)" }}>{composerOpen ? "▾" : "▸"}</span>
         </button>
-        {composerOpen && (
+        {composerOpen && (canAsk ? (
           <>
             <div className="composer__row">
               <textarea
@@ -1015,7 +1111,14 @@ function ContextPanel({ job, agent, result, acting, composerOpen, onToggleCompos
               {rtState && rtState !== "open" ? " · reconnecting…" : ""}
             </div>
           </>
-        )}
+        ) : (
+          // Honest, instead of a Send button that silently does nothing: the
+          // bridge can only open a conversation on service requests and permits.
+          <div className="composer__hint" style={{ marginTop: 8 }}>
+            The operations team can act on service requests and work permits — open one of those to ask.
+            Use the buttons above for this record.
+          </div>
+        ))}
       </div>
     </>
   );
@@ -1219,7 +1322,7 @@ function ImportantRow({ it, rank, selected, acting, onPick, onOpenQueue, onActio
   return (
     <div
       id={"row-" + it.external_id}
-      className="card" role="button" tabIndex={0} aria-selected={selected}
+      className="card" role="button" tabIndex={0} aria-current={selected}
       style={{ "--sev": SEV_VAR[sev] }}
       onClick={onPick}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}
@@ -1288,7 +1391,7 @@ function Card({ r, selected, acting, onPick, onAction }) {
   return (
     <div
       id={"row-" + r.external_id}
-      className="card" role="button" tabIndex={0} aria-selected={selected}
+      className="card" role="button" tabIndex={0} aria-current={selected}
       style={{ "--sev": SEV_VAR[sev] }}
       onClick={onPick}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}
@@ -1375,6 +1478,35 @@ const Icon = ({ name, size = 13 }) => {
     </svg>
   );
 };
+
+/**
+ * One-time orientation for a brand-new operator — three lines mapping the three
+ * panes, dismissed once and never seen again (localStorage). Rubric: "a guided
+ * first run". Skipped entirely where localStorage is unavailable, rather than
+ * nagging on every load.
+ */
+const INTRO_KEY = "fm360_intro_seen";
+function FirstRun() {
+  const [seen, setSeen] = useState(() => {
+    try { return localStorage.getItem(INTRO_KEY) === "1"; } catch (e) { return true; }
+  });
+  if (seen) return null;
+  function dismiss() {
+    try { localStorage.setItem(INTRO_KEY, "1"); } catch (e) {}
+    setSeen(true);
+  }
+  return (
+    <div className="ai" style={{ marginTop: 0, marginBottom: 16, display: "flex", gap: 12, alignItems: "flex-start" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="ai__label"><Icon name="spark" /> Welcome to FM 360</div>
+        Everything that needs a human across your maintenance queues, ranked. Queues sit on the left,
+        the most pressing work is listed here, and selecting a record shows its context and next step on
+        the right — most items resolve in one click.
+      </div>
+      <button className="btn btn--sm" onClick={dismiss} style={{ flex: "none" }}>Got it</button>
+    </div>
+  );
+}
 
 const SkeletonList = ({ rows = 5 }) => (
   <div className="cards">

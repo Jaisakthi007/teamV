@@ -1025,16 +1025,34 @@ async function vendorMap() {
 // queues were split stays hidden instead of reappearing under its new id.
 function hiddenSet(d, bucketId, aliases) {
   const out = new Set();
+  // No try/catch: a dead job_state read used to fall back to an empty set, which
+  // silently RESURRECTED every already-actioned card as open work. Failing the
+  // bucket read is the honest outcome — counts already surfaces a per-bucket
+  // error, and the console shows an inline error with a retry.
   for (const prefix of [bucketId].concat(aliases || [])) {
-    try {
-      const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [prefix + ":%"]);
-      for (const r of rows) {
-        const eid = String(r.external_id);
-        out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
-      }
-    } catch (e) { /* a dead read must not un-hide everything */ }
+    const { rows } = d.query("select external_id from job_state where action_taken = 'true' and external_id like $1", [prefix + ":%"]);
+    for (const r of rows) {
+      const eid = String(r.external_id);
+      out.add(bucketId + ":" + eid.slice(eid.indexOf(":") + 1));
+    }
   }
   return out;
+}
+
+// True when this job was already actioned — the guard every write handler runs
+// FIRST, so a browser retry after a timeout (or a double-submit that slipped past
+// the UI's disabled state) never writes the same comment/quote/decision twice.
+// The Facilio write used to run before job_state was recorded, which made every
+// retry a duplicate.
+function alreadyActioned(d, externalId) {
+  try {
+    const { rows } = d.query("select action_taken, action_type from job_state where external_id = $1", [externalId]);
+    return rows.length && rows[0].action_taken === "true" ? (rows[0].action_type || "Actioned") : null;
+  } catch (e) {
+    // If the guard itself cannot read, let the write proceed — a possible
+    // duplicate comment beats definitely losing the action.
+    return null;
+  }
 }
 // Deliberately the size of the (deduped, rewritten) set rather than its own
 // count(*): with aliases in play the same record can be recorded under two
@@ -1157,6 +1175,11 @@ server.addHandler({
     const actionType = args.action_type || "Actioned";
     const now = nowIso();
 
+    // Retry / double-submit: already actioned means already commented — succeed
+    // without writing a second comment.
+    const done = alreadyActioned(d, args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, action_type: done, syncStatus: "synced", idempotent: true };
+
     let syncStatus = "synced", syncError = null;
     try {
       const who = args.actor ? " by " + args.actor : "";
@@ -1198,6 +1221,12 @@ server.addHandler({
     const decision = (args.decision || "").toLowerCase();
     if (decision !== "approve" && decision !== "reject") throw new Error("decision must be 'approve' or 'reject'");
     const permit_status = decision === "approve" ? "Permit Approved" : "Permit Rejected";
+
+    // Retry / double-submit: the decision was already applied — do not push a
+    // second status change at the permit.
+    const dGuard = db();
+    const done = alreadyActioned(dGuard, args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, decision, permit_status: done, idempotent: true };
 
     let syncStatus = "synced", syncError = null;
     try {
@@ -1272,6 +1301,12 @@ server.addHandler({
 
     const seg = String(args.external_id).split(":");
     const srId = Number(seg[seg.length - 1]);
+
+    // Retry / double-submit: a quote already exists for this request — creating a
+    // second one is the worst duplicate in the console, so this guard runs before
+    // anything else.
+    const done = alreadyActioned(db(), args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, amount, quoteId: null, idempotent: true };
 
     // pull the full service request to source the rest of the payload
     const resp = await callAction("facilio-cmms", "list-service-requests", {
@@ -1368,6 +1403,11 @@ server.addHandler({
     let updates = [];
     try { updates = JSON.parse(args.updates || "[]"); } catch (e) { throw new Error("updates must be a JSON array"); }
     if (!updates.length) throw new Error("no line updates provided");
+
+    // Retry / double-submit: the PO lines were already corrected in a previous
+    // call — re-applying would overwrite any later manual edits made in Facilio.
+    const done = alreadyActioned(db(), args.external_id);
+    if (done) return { ok: true, external_id: args.external_id, updated: 0, idempotent: true };
 
     const lineItems = updates.map((u) => ({ id: u.lineId, unitPrice: Number(u.unitPrice) }));
     let syncStatus = "synced", syncError = null;
