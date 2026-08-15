@@ -1077,6 +1077,8 @@ function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onTogg
   const scroller = useRef(null);
   const { age, sev, acts, primary } = jobView(job);
   const others = acts.filter((a) => a !== primary);
+  const panelScroller = useRef(null);
+  useEffect(() => { if (panelScroller.current) panelScroller.current.scrollTop = 0; }, [job.external_id]);
   const busy = !!(agent && agent.busy);
   const isPermit = agent?.intent === "review_permit";
   const panelTitle = AGENT_TITLES[agent?.intent] || "Service Request Operations";
@@ -1109,7 +1111,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onTogg
 
   return (
     <>
-      <div className="panel__scroll">
+      <div className="panel__scroll" ref={panelScroller}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="panel__id">{job.ref}{job.local_id ? " · #" + job.local_id : ""}</div>
