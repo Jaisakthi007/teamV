@@ -9,7 +9,7 @@ function cfg(key) {
       if (process.env && process.env[key] != null) return process.env[key];
       if (process.system && process.system[key] != null) return process.system[key];
     }
-  } catch (e) {}
+  } catch {}
   return undefined;
 }
 function db() {
@@ -59,7 +59,7 @@ const BUCKET_LABELS = {
 const PRIORITY_RANK = { High: 0, Medium: 1, Signal: 2, Normal: 3, Low: 4 };
 const PRIORITY_SQL =
   "case cj.priority when 'High' then 0 when 'Medium' then 1 when 'Signal' then 2 when 'Normal' then 3 when 'Low' then 4 else 5 end";
-const OPEN_ONLY = "(js.action_taken is null or js.action_taken = '' or js.action_taken <> 'true')";
+const OPEN_ONLY = "(js.action_taken is null or js.action_taken <> 'true')";
 const JOIN = "console_jobs cj left join job_state js on js.external_id = cj.external_id";
 
 // A common row builder so every bucket's mapper stays small and consistent.
@@ -107,8 +107,6 @@ const BUCKET_SYNC = {
     expand: "siteId,client,requester",
     module: "servicerequest",
     idField: "id",
-    writeBackAction: "add-service-request-comment", // used by the action handler
-    urlModule: "servicerequest",
     toRow(r) {
       const id = r.id, state = r.moduleState || "";
       const requester = nameOf(r.requester), site = nameOf(r.siteId) || nameOf(r.site);
@@ -116,7 +114,7 @@ const BUCKET_SYNC = {
       const meta = ["Service request", state ? "Status " + state : null, site || null,
         requester ? "Raised by " + requester : null, r.sysCreatedTime ? "Created " + r.sysCreatedTime : null].filter(Boolean).join(" · ");
       return baseRow("tsr", "servicerequest", id, {
-        ref: "TSR-" + (r.localId && r.localId !== 0 ? r.localId : id),
+        ref: "TSR-" + (r.localId || id),
         title: r.subject, priority: nameOf(r.urgency) || nameOf(r.priority) || "Normal",
         meta, status: state || "open", site, tenant, requested_by: requester,
         // Canonical module name, matched exactly by the web app's
@@ -204,7 +202,7 @@ server.addHandler({
         try {
           const sk = BUCKET_SYNC[bk] && BUCKET_SYNC[bk].syncKey;
           if (sk) d.query("update sync_state set last_run_status = $2, updated_at = $3 where sync_key = $1", [sk, "error: " + msg.slice(0, 200), nowIso()]);
-        } catch (e2) {}
+        } catch {}
       }
     }
     return { ok: true, ranAt: nowIso(), totalProcessed: results.reduce((a, r) => a + (r.processed || 0), 0), results };
@@ -239,7 +237,7 @@ server.addHandler({
     );
     const jobs = rows.map((r) => {
       let actions = [];
-      try { actions = JSON.parse(r.actions || "[]"); } catch (e) {}
+      try { actions = JSON.parse(r.actions || "[]"); } catch {}
       return { ...r, actions, priorityRank: PRIORITY_RANK[r.priority] != null ? PRIORITY_RANK[r.priority] : 3 };
     });
     return { jobs, page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) };
@@ -259,7 +257,8 @@ server.addHandler({
     if (originFilter) { p.push(originFilter); conds.push(`cj.origin = $${p.length}`); }
     const where = "where " + conds.join(" and ");
     const buckets = d.query(`select cj.bucket, cj.bucket_label, count(*)::int as count from ${JOIN} ${where} group by cj.bucket, cj.bucket_label`, p).rows;
-    const total = d.query(`select count(*)::int as count from ${JOIN} ${where}`, p).rows[0].count;
+    // The total is by definition the sum of the group counts — no second scan.
+    const total = buckets.reduce((a, b) => a + b.count, 0);
     const syncState = d.query("select sync_key, last_execution_time, last_run_status, last_run_count, updated_at from sync_state").rows;
     const actioned = d.query("select count(*)::int as count from job_state where action_taken = 'true'").rows[0].count;
     return { total, buckets, syncState, actioned };

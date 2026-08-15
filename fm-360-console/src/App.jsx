@@ -127,6 +127,23 @@ const LOAD_DRILL = [
 // rotation never nudges the content under it.
 const LOADER_LINE = { display: "block", minHeight: 20, lineHeight: "20px" };
 
+// The modals (reject, quote, drill) share one scrim and one dialog shell,
+// differing only in width plus the drill's own size overrides.
+const SCRIM = { position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 };
+const dialogStyle = (width, extra) => ({
+  width, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14,
+  padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)", ...extra,
+});
+
+// One derivation shared by Card and ContextPanel: how old the record is, which
+// severity paints it, and which actions (and primary verb) it offers.
+function jobView(job) {
+  const age = ageInfo(job.created_time);
+  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
+  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
+  return { age, sev, acts, primary: acts.find((a) => a.kind === "primary") };
+}
+
 /**
  * Rotate a loading caption every `intervalMs` while `active`.
  *
@@ -171,6 +188,10 @@ export default function App() {
   const [quote, setQuote] = useState(null);
   const [quoteAmount, setQuoteAmount] = useState("");
   const [quoteBusy, setQuoteBusy] = useState(false);
+  const [reject, setReject] = useState(null);         // { job } — reject-reason dialog
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejectError, setRejectError] = useState(null);
+  const [rejectBusy, setRejectBusy] = useState(false);
   const [agent, setAgent] = useState(null); // { job, threadId, turns[], busy }
   const [drill, setDrill] = useState(null);       // { job }
   const [drillData, setDrillData] = useState(null); // { po, lines, autoMatch }
@@ -374,6 +395,14 @@ export default function App() {
   async function gotoPage(p) { if (!bucket || p < 1 || p > pageData.totalPages) return; clearSelection(); await loadPage(bucket, p); }
 
   function clearSelection() { setSelected(null); setPanelOpen(false); setResult(null); setComposerOpen(false); }
+
+  // Optimistic local removal: drop the card from the open page, the ranked list,
+  // and the queue badge. Each caller reconciles with the server right after.
+  function removeJobLocally(job) {
+    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
+    setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
+    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+  }
   function pick(job) {
     setSelected(job);
     setPanelOpen(true);
@@ -388,39 +417,15 @@ export default function App() {
     // team, not a one-shot write.
     if (action.act === "agent") { openAgent(job, action); return; }
     if (action.act === "drill") { openDrill(job); return; }
-    if (action.act === "approve" || action.act === "reject") {
-      setActingId(job.external_id);
-      setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
-      setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-      // On the landing view the ranked row is the card — it leaves optimistically too.
-      setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
-      setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-      try {
-        const res = await vibe.executeFunction("feed", "permit_decision", { external_id: job.external_id, decision: action.act, actor });
-        if (res?.ok) {
-          setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}` });
-          flash(`${job.ref} — ${res.permit_status}`); await refreshCounts(); await loadPage(bucket, page);
-          if (!bucket) await refreshImportant({ quiet: true });
-        } else {
-          setResult({ id: job.external_id, status: "err", text: res?.error || "Could not complete that." });
-          flash(`Couldn't ${action.label.toLowerCase()}: ${res?.error || "error"}`); await loadPage(bucket, page);
-          if (!bucket) await refreshImportant({ quiet: true });
-        }
-      } catch (e) {
-        setResult({ id: job.external_id, status: "err", text: String(e?.message || e) });
-        flash(`${action.label} failed: ` + (e?.message || e)); await loadPage(bucket, page);
-        if (!bucket) await refreshImportant({ quiet: true });
-      }
-      finally { setActingId(null); }
-      return;
-    }
+    // Refusing a permit stops a contractor's job, and the reason is kept
+    // permanently on the record — so it is collected first, never blank.
+    if (action.act === "reject") { setReject({ job }); setRejectReason(""); setRejectError(null); return; }
+    if (action.act === "approve") { await decidePermit(job, "approve"); return; }
     if (action.act !== "action") { flash(`${action.label} · ${job.ref}`); return; }
     setActingId(job.external_id);
     setResult({ id: job.external_id, status: "busy", text: action.label + "…" });
     // optimistic: remove the card and drop the badge now (ranked row included)
-    setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-    setImportant((prev) => (Array.isArray(prev) ? prev.filter((i) => i.external_id !== job.external_id) : prev));
-    setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
+    removeJobLocally(job);
     try {
       const res = await vibe.executeFunction("feed", "act", { external_id: job.external_id, action_type: action.label, actor });
       if (res?.ok) {
@@ -539,6 +544,64 @@ export default function App() {
     if (bucket) await loadPage(bucket, page);
   }
 
+  /**
+   * Approve or reject a work permit for real (theirs, kept verbatim in spirit).
+   *
+   * The card is NOT removed up front. An optimistic removal is only honest when
+   * the write cannot meaningfully fail; this one can — and when it did, the card
+   * vanished while the permit sat untouched in Facilio. So: hold the card, wait
+   * for the handler to confirm the record actually moved off "Awaiting FM
+   * Approval", and only then drop it — from the queue AND the ranked list.
+   */
+  async function decidePermit(job, decision, reason) {
+    setActingId(job.external_id);
+    const label = decision === "approve" ? "Approving" : "Rejecting";
+    setResult({ id: job.external_id, status: "busy", text: label + "…" });
+    try {
+      const res = await vibe.executeFunction("feed", "permit_decision", {
+        external_id: job.external_id, decision, actor,
+        ...(decision === "reject" ? { rejection_reason: reason || "" } : {}),
+      });
+      if (res?.ok) {
+        // Verified: the handler re-read the permit and it had moved.
+        const moved = res.after_state ? ` · now ${res.after_state}` : "";
+        setResult({ id: job.external_id, status: "ok", text: `${job.ref} — ${res.permit_status}${moved}` });
+        flash(`${job.ref} — ${res.permit_status}${res.verified === false ? " (sent, but could not re-read the permit)" : ""}`);
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : refreshImportant({ quiet: true })]);
+        return { ok: true };
+      }
+      const err = res?.error || "Could not complete that.";
+      // Nothing was removed, so there is nothing to restore — the card is still
+      // on screen, now carrying the reason it did not go through.
+      setResult({ id: job.external_id, status: "err", text: err });
+      flash(`Couldn't ${decision} ${job.ref}: ${err}`);
+      return { ok: false, error: err };
+    } catch (e) {
+      const err = String(e?.message || e);
+      setResult({ id: job.external_id, status: "err", text: err });
+      flash(`${decision === "approve" ? "Approve" : "Reject"} failed: ` + err);
+      return { ok: false, error: err };
+    } finally { setActingId(null); }
+  }
+
+  async function submitReject() {
+    const job = reject.job;
+    const reason = rejectReason.trim();
+    // Same rule the handler enforces, applied here so the FM finds out before
+    // the round trip rather than after it.
+    if (reason.length < 40 || reason.split(/\s+/).filter(Boolean).length < 6) {
+      setRejectError("Say which safety items were missing or unsatisfied, and what must be put right before the permit is raised again.");
+      return;
+    }
+    setRejectBusy(true); setRejectError(null);
+    try {
+      const res = await decidePermit(job, "reject", reason);
+      if (res?.ok) setReject(null);
+      else setRejectError(res?.error || "Could not reject that permit.");
+    } finally { setRejectBusy(false); }
+  }
+
   async function submitQuote() {
     const amt = Number(quoteAmount);
     if (!amt || amt <= 0) { flash("Enter a valid quoted amount"); return; }
@@ -550,10 +613,8 @@ export default function App() {
         flash(`Tenant quote created for ${job.ref}${res.quoteId ? " · #" + res.quoteId : ""}`);
         setResult({ id: job.external_id, status: "ok", text: `Tenant quote created${res.quoteId ? " · #" + res.quoteId : ""}` });
         setQuote(null);
-        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-        await refreshCounts(); await loadPage(bucket, page);
-        if (!bucket) await refreshImportant({ quiet: true });
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), bucket ? loadPage(bucket, page) : refreshImportant({ quiet: true })]);
       } else {
         flash("Couldn't create quote: " + (res?.error || "unknown error"));
       }
@@ -591,9 +652,8 @@ export default function App() {
       if (res?.ok) {
         flash(`${job.ref} — ${res.updated} line${res.updated === 1 ? "" : "s"} updated`);
         setDrill(null);
-        setPageData((pd) => ({ ...pd, jobs: pd.jobs.filter((j) => j.external_id !== job.external_id), total: Math.max(0, pd.total - 1) }));
-        setCounts((cs) => cs.map((c) => (c.bucket === job.bucket ? { ...c, count: Math.max(0, (c.count || 0) - 1) } : c)));
-        await refreshCounts(); await loadPage(bucket, page);
+        removeJobLocally(job);
+        await Promise.all([refreshCounts(), loadPage(bucket, page)]);
       } else { flash("Couldn't update PO: " + (res?.error || "error")); }
     } catch (e) { flash("Update failed: " + (e?.message || e)); }
     finally { setDrillBusy(false); }
@@ -629,7 +689,7 @@ export default function App() {
   useEffect(() => {
     function onKey(e) {
       if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
-      if (quote || drill) return; // j/k must not move the list behind an open modal
+      if (quote || drill || reject) return; // j/k must not move the list behind an open modal
       if (e.key === "Escape") { clearSelection(); return; }
       const list = rows;
       if (!list.length) return;
@@ -639,7 +699,7 @@ export default function App() {
       e.preventDefault();
       const i = list.findIndex((r) => r.external_id === selected?.external_id);
       const next = isDown ? Math.min(list.length - 1, i + 1) : Math.max(0, i < 0 ? 0 : i - 1);
-      const target = list[i < 0 ? 0 : next];
+      const target = list[next];
       if (target) {
         pick(target);
         document.getElementById("row-" + target.external_id)?.scrollIntoView({ block: "nearest" });
@@ -647,7 +707,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [rows, selected, quote, drill]); // eslint-disable-line
+  }, [rows, selected, quote, drill, reject]); // eslint-disable-line
 
   // Rotating captions. Each is idle (and its timer unmounted) unless the thing it
   // describes is actually in flight, so nothing here re-renders the console while
@@ -890,9 +950,33 @@ export default function App() {
         </aside>
       </div>
 
+      {reject && (
+        <div onClick={() => !rejectBusy && setReject(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(520)}>
+            <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 2 }}>Reject permit</div>
+            <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 18 }}>{reject.job.ref} · {reject.job.title}</div>
+            <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--ink-3)" }}>Reason for rejection</label>
+            <textarea
+              autoFocus rows={5} value={rejectReason}
+              onChange={(e) => { setRejectReason(e.target.value); if (rejectError) setRejectError(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitReject(); }}
+              placeholder="e.g. Isolation evidence is missing — no photo of the applied lock/tag and the isolator reference is not recorded. Attach both before resubmitting."
+              style={{ width: "100%", marginTop: 6, padding: "10px 12px", fontSize: 14, lineHeight: 1.5, border: "1px solid " + (rejectError ? "var(--critical)" : "var(--hairline-strong)"), borderRadius: 8, outline: "none", font: "inherit", resize: "vertical" }}
+            />
+            <div style={{ fontSize: 12, color: rejectError ? "var(--critical-ink)" : "var(--ink-3)", marginTop: 8 }}>
+              {rejectError || "This is recorded permanently on the permit and is the only thing the contractor is told. Name the specific safety items that were missing or unsatisfied."}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
+              <button className="btn" disabled={rejectBusy} onClick={() => setReject(null)}>Cancel</button>
+              <button className="btn btn--primary" disabled={rejectBusy || !rejectReason.trim()} onClick={submitReject}>{rejectBusy ? "Rejecting…" : "Reject permit"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {quote && (
-        <div onClick={() => !quoteBusy && setQuote(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 420, maxWidth: "92vw", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+        <div onClick={() => !quoteBusy && setQuote(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(420)}>
             <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 2 }}>Create Tenant Quote</div>
             <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 18 }}>{quote.job.ref} · {quote.job.title}</div>
             <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--ink-3)" }}>Quoted amount</label>
@@ -913,8 +997,8 @@ export default function App() {
       )}
 
       {drill && (
-        <div onClick={() => !drillBusy && setDrill(null)} style={{ position: "fixed", inset: 0, background: "rgba(16,19,23,.42)", display: "grid", placeItems: "center", zIndex: 80 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 780, maxWidth: "94vw", maxHeight: "88vh", overflow: "auto", background: "var(--surface)", borderRadius: 14, padding: "22px 24px", boxShadow: "0 20px 60px rgba(16,19,23,.3)" }}>
+        <div onClick={() => !drillBusy && setDrill(null)} style={SCRIM}>
+          <div onClick={(e) => e.stopPropagation()} style={dialogStyle(780, { maxWidth: "94vw", maxHeight: "88vh", overflow: "auto" })}>
             <div style={{ fontSize: 17, fontWeight: 600 }}>Referred order · {drill.job.ref}</div>
             <div style={{ fontSize: 13, color: "var(--ink-2)", marginBottom: 14 }}>Update each referred line's PO unit cost to match the invoice, or edit manually.</div>
             {!drillData && (
@@ -987,10 +1071,7 @@ function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onTogg
   const [draft, setDraft] = useState("");
   const [rtState, setRtState] = useState(vibe.realtimeState);
   const scroller = useRef(null);
-  const age = ageInfo(job.created_time);
-  const sev = job.tone ? sevOf(job.tone, job.priority) : (age.sev || "info");
-  const acts = (job.actions || []).filter((a) => a.act !== "open" || job.record_url);
-  const primary = acts.find((a) => a.kind === "primary");
+  const { age, sev, acts, primary } = jobView(job);
   const others = acts.filter((a) => a !== primary);
   const busy = !!(agent && agent.busy);
   const isPermit = agent?.intent === "review_permit";
@@ -1001,9 +1082,18 @@ function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onTogg
   const waitLine = useLoaderLine(isPermit ? LOAD_PERMIT : LOAD_AGENT, busy && !agent?.note, 3200);
 
   useEffect(() => vibe.onRealtimeState?.(setRtState), []);
+  // Follow the conversation only while the FM is already at the end of it: a new
+  // turn must never yank them away from an earlier answer they are reading back.
+  // Scrolling to within 48px of the bottom re-arms the follow.
+  const stick = useRef(true);
   useEffect(() => {
     const el = scroller.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el || !stick.current) return;
+    el.scrollTop = el.scrollHeight;
+    // The conversation sits under the record's facts in the panel's own scroll, so
+    // the newest turn also has to be brought into the panel — otherwise the answer
+    // arrives off the bottom of it. "nearest" scrolls the minimum needed.
+    el.scrollIntoView({ block: "nearest" });
   }, [agent?.turns, busy]);
 
   function submit() {
@@ -1084,7 +1174,16 @@ function ContextPanel({ job, agent, result, acting, composerOpen, canAsk, onTogg
               <span>{panelTitle}</span>
               <button className="btn btn--ghost btn--sm" onClick={onDismissAgent}>Dismiss</button>
             </div>
-            <div ref={scroller} className="turns" style={{ maxHeight: 320, overflowY: "auto" }}>
+            {/* The transcript scrolls inside itself, and its cap follows the
+                viewport so one very long reply can never fill the whole panel. */}
+            <div
+              ref={scroller} className="turns"
+              style={{ maxHeight: "min(46dvh, 360px)", overflowY: "auto", overscrollBehavior: "contain" }}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+              }}
+            >
               {agent.turns.map((t, i) => <Turn key={i} turn={t} />)}
               {busy && (
                 <div className="turn turn--agent" style={{ color: "var(--brand-ink)", minHeight: 20 }}>
@@ -1180,12 +1279,7 @@ function ImportantNow({ items, busy, error, at, selectedId, actingId, onPick, on
   // carry no severity breakdown, so anything wider would be invented.
   const glance = useMemo(() => {
     const g = { critical: 0, warning: 0, info: 0 };
-    for (const it of (items || [])) {
-      const chips = (it.why || []).map((w, j) => (it.why_tones || [])[j] || guessTone(w));
-      const worst = worstTone(chips.concat(it.tone ? [it.tone] : []));
-      const s = { red: "critical", amber: "warning", purple: "info", blue: "info" }[worst] || "info";
-      g[s] += 1;
-    }
+    for (const it of (items || [])) g[importantSev(it)] += 1;
     return g;
   }, [items]);
 
@@ -1327,10 +1421,16 @@ function importantActions(it) {
   return [];
 }
 
+// One severity for a ranked item, shared by the glance strip and each row so
+// the two can never disagree about how a record reads.
+function importantSev(it) {
+  const tones = (it.why || []).map((w, j) => (it.why_tones || [])[j] || guessTone(w));
+  return TONE_SEV[worstTone(tones.concat(it.tone ? [it.tone] : []))] || "info";
+}
+
 function ImportantRow({ it, rank, selected, acting, onPick, onOpenQueue, onAction }) {
   const chips = (it.why || []).map((w, j) => ({ text: w, tone: (it.why_tones || [])[j] || guessTone(w) }));
-  const worst = worstTone(chips.map((c) => c.tone).concat(it.tone ? [it.tone] : []));
-  const sev = TONE_SEV[worst] || "info";
+  const sev = importantSev(it);
   const caption = [it.site, it.tenant].filter(Boolean).join(" · ");
   const acts = importantActions(it);
   return (
@@ -1392,9 +1492,7 @@ function ImportantRow({ it, rank, selected, acting, onPick, onOpenQueue, onActio
    One card anatomy for every queue: accent bar, id + chips, title, meta, verb.
    ========================================================================== */
 function Card({ r, selected, acting, onPick, onAction }) {
-  const age = ageInfo(r.created_time);
-  const sev = r.tone ? sevOf(r.tone, r.priority) : (age.sev || "info");
-  const acts = (r.actions || []).filter((a) => a.act !== "open" || r.record_url);
+  const { age, sev, acts } = jobView(r);
   const chips = [];
   if (r.flag) chips.push(r.flag);
   // flag2 is the record's second fact (e.g. "Chargeable to tenant") — it sits
